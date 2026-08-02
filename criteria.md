@@ -1,0 +1,116 @@
+# tcode 验证 Criteria(v1)
+
+这份文档是 [spec.md](spec.md) 第 12 节"测试与验证策略"的**可执行版本**:spec.md 说的是"分几层测、每层测什么",这份文档把它落成一条条可以直接打勾的具体断言,每条尽量能对应到一个单测 / loop 场景测试 / 手工验证步骤。写代码/写测试时可以直接对着这份清单过,不用回 spec.md 里翻。
+
+用法:
+- 实现某个模块时,把对应小节的条目全部打勾才算这个模块做完。
+- 12.5 节"第一次实现完之后怎么验证"里的手工验证,就是把下面这些条目手工过一遍。
+- 以后 spec.md 有决策变化,先改 spec.md,再回来同步这份文件,避免两边不一致。
+- 条目后面的 `(§x)` 指向 spec.md 对应章节,方便查为什么要这么验证。
+
+---
+
+## 1. CLI / REPL 基础(§2、§4)
+
+- [x] `npm run dev`(或 link 后的 `tcode`)能进入 REPL 并展示提示符
+- [x] 输入空行 / `exit` / `Ctrl+D` 能正常退出进程,没有孤儿子进程残留(尤其是 bash 工具起过子进程之后)
+- [x] 不传参数启动 → 新建 session,`.tcode/sessions/` 下生成新文件,`messages` 为空
+- [x] `--continue` → 加载 cwd 下 `updatedAt` 最新的 session 文件,历史正确接续,新一轮对话能看到之前的上下文
+- [x] `--resume <id>` → 精确匹配存在的 session 能恢复
+- [x] `--resume <不存在的id>` → 给出清晰报错,不崩溃、不静默新建
+- [x] `.tcode/` 已经在 `.gitignore` 里,不会被误提交
+
+## 2. Agent Turn 循环(§3、§12.2)
+
+- [x] 空 `toolUses` → turn 正常结束,不再调用 LLM,提示符还给用户
+- [x] 单独一个 `finish` → 执行、回填 `tool_result`、break,不再调用 LLM
+- [x] **回归锁**:`finish` 与其他 tool_use 混在同一响应 → 全部执行、`tool_result` 全部回填、消息历史闭合;之后模拟一次 `--continue` 追加新 user 消息,不因为悬空 tool_use 报错
+- [x] 工具执行抛错 → `is_error: true` 回填给模型,loop 不崩溃,模型能继续下一轮
+- [x] 用户对 `bash` 拒绝确认(输入 n)→ 回填"用户拒绝"的 `is_error` 结果,不执行命令,loop 继续
+- [x] 连续 `MAX_TOOL_ITERATIONS` 次都返回 tool_use、不返回 `finish` → 强制中断并打印提示,session 仍完整可保存
+- [x] 单批多个非 `finish` 工具 → 按顺序串行执行(用带副作用的假工具验证执行顺序,不是并发乱序)
+- [x] 模型文本输出通过 `onTextDelta` 增量打印,能观察到逐块输出而不是一次性蹦出整段
+- [x] 单条 tool_result 内容超过 `MAX_OUTPUT_CHARS` 时按首尾截断规则处理,不会把巨量内容原样灌进 messages
+
+## 3. 工具集(§5)
+
+### 3.1 `bash`(§5.1)
+- [x] 默认执行前打印命令并等待确认(y 确认/n 拒绝/回车默认确认)
+- [x] `--full-auto` 启动时跳过确认,直接执行
+- [x] 输出超过 `MAX_OUTPUT_CHARS` 时首尾各留一半 + 截断提示
+- [x] 超过 `COMMAND_TIMEOUT_MS`(默认 60s)后强制结束,返回超时错误而不是无限挂起
+- [x] 返回结构包含 `stdout`/`stderr`/`exitCode`,且 `exitCode` 与实际命令一致
+
+### 3.2 `read_file`(§5.2)
+- [x] 返回内容带行号(类似 `cat -n`)
+- [x] `offset`/`limit` 生效,能分段读取大文件
+- [x] 文件不存在 → `is_error: true`
+- [x] 路径是目录 → `is_error: true`
+
+### 3.3 `edit_file`(§5.3)
+- [x] `old_string` 唯一匹配 → 替换成功,文件内容正确
+- [x] `old_string` 零匹配 → 报错,提示"未找到匹配"
+- [x] `old_string` 多处匹配且 `replace_all` 非 `true` → 报错并告知匹配了几处,不做任何修改
+- [x] `old_string` 多处匹配且 `replace_all: true` → 全部替换
+- [x] `old_string === ""` 且文件不存在 → 视为创建新文件,内容等于 `new_string`
+- [x] `old_string === ""` 且文件已存在 → 报错,提示改用 `write_file`,文件内容不变
+
+### 3.4 `write_file`(§5.4)
+- [x] 目标文件不存在 → 创建成功
+- [x] 目标文件已存在 → 整体覆盖成功
+
+### 3.5 `finish`(§5.5)
+- [x] `status: "done"` 和 `status: "blocked"` 都能正确传递,CLI 对两种状态有可区分的展示
+- [x] `finish` 执行后 loop 正确 break,回到 REPL 提示符
+
+### 3.6 `spawn_agent`(§5.6)
+- [x] `role: "general"` 的子 agent 能访问除 `spawn_agent` 自身外的全部工具
+- [x] `role: "explore"` 的子 agent 拿不到 `edit_file`/`write_file`(调用会因为工具不存在而失败,不是被 approval 拦下)
+- [x] 任意 `role` 的子 agent 工具集里都不包含 `spawn_agent` 自己(防递归验证)
+- [x] 子 agent 内部的 `bash` 调用依然会触发确认(除非 `--full-auto`),不会绕过审批
+- [x] 子 agent 结束后,主 session 的 `messages` 只多一条 `spawn_agent` 的 `tool_result`,不包含子 agent 内部的中间消息
+- [x] 子 agent 执行过程在终端有可区分主/子的标记(比如前缀或缩进)
+- [x] 子 agent 撞到 `MAX_TOOL_ITERATIONS` 仍未 `finish` 时,能正常把"未完成"信息回传给主 agent,不会挂起主 loop
+
+## 4. 目录范围限制(§6)
+
+- [x] 相对路径解析在 `ROOT` 内 → 正常读写
+- [x] 路径含 `../` 试图逃逸出 `ROOT` → 拒绝,报错信息包含 "path escapes project root" 或等价说明
+- [x] 绝对路径指向 `ROOT` 外 → 拒绝
+- [x] 路径恰好等于 `ROOT` 本身(边界值)→ 允许
+- [x] `bash` 里执行 `cd .. && ls` 之类命令不受目录检查阻止(已知限制,确认这是预期行为而非 bug,行为需要和 spec §1/§6 描述一致)
+
+## 5. Provider / 多模型(§8)
+
+- [x] `PROVIDER=anthropic`(或未设置,默认值)时只要求 `ANTHROPIC_API_KEY` 存在,`DEEPSEEK_*` 缺失不影响启动
+- [x] `PROVIDER=deepseek` 时只要求 `DEEPSEEK_API_KEY` 存在,`ANTHROPIC_*` 缺失不影响启动
+- [x] 当前 provider 必需的 `*_API_KEY` 缺失 → `resolveProviderConfig` 直接抛错(`MissingApiKeyError`);`index.ts` 尚未接入,"启动直接报错退出不进入 REPL" 这半句留到 CLI 落地时再验
+- [x] `llm/adapters/anthropic.ts` 和 `openai-compat.ts` 的归一化类型往返转换(message/tool_use/tool_result/system)结果一致,无字段丢失
+- [ ] 用同一个真实任务(如"新建一个文件并跑测试")分别跑 Anthropic 和 DeepSeek 各一遍,两边都能正常完成、不因 adapter 转换问题崩溃 —— **DeepSeek 侧已实跑通过**(新建文件 + `node` 验证 + `edit_file` 改写),Anthropic 侧待验:本机 `.env` 里 `ANTHROPIC_API_KEY` 为空
+- [ ] 恢复一个由 provider A 创建的 session,当前配置是 provider B → 启动时给出提示,但仍能正常继续对话,不报错 —— 提示逻辑已实现(`index.ts` 比对 `session.provider`),同样等有第二个 provider 的 key 才能实跑
+
+## 6. 会话持久化(§4)
+
+- [x] `messages` 落盘为归一化内部格式(不是某个 provider 的原始 wire 格式)
+- [x] session JSON 里 `provider`/`model` 字段与实际使用的 provider/model 一致
+- [x] `--continue` 选中的确实是 `updatedAt` 最新的文件(有多个 session 时验证)
+
+## 7. 项目级记忆(§9)
+
+- [x] 项目根目录存在 `AGENTS.md` 时,内容被正确拼进 system prompt
+- [x] 不存在 `AGENTS.md`/`TCODE.md` 时静默跳过,不报错、不阻塞启动
+- [x] `AGENTS.md` 和 `TCODE.md` 同时存在时,优先使用 `AGENTS.md`
+
+## 8. 测试基础设施本身(§12)
+
+- [x] `tests/unit/` 覆盖 `security`/`edit_file`/`session`/`adapters`/`approval`/`spawn_agent`,且都能独立运行、不需要网络
+- [x] `tests/loop/agent-loop.test.ts` 覆盖 §12.2 列出的全部 8 条场景,用假 `llm.send()`,不接真实网络
+- [ ] `tests/fixtures/<provider>/` 下每个 provider 至少有"纯文本回复"“单 tool_use”“多 tool_use”三种 fixture,回放测试能跑通
+- [ ] `tests/e2e/smoke.test.ts` 至少覆盖:新建文件、`edit_file` 唯一匹配成功、`edit_file` 多匹配报错后重试成功、读不存在文件报错、`bash` 跑测试 这 5 个代表性任务
+- [ ] CI 中单测 + loop 场景测试作为必过项(阻塞合并);fixture 回放测试和 e2e 冒烟作为独立 job,允许失败但需要人工定期查看
+
+---
+
+## 验收标准
+
+第 1-7 节的条目**全部打勾**,视为 v1 达到 spec.md 里定义的完成状态,可以进入日常 dogfooding 阶段(§12.5 第 7 步)。第 8 节是测试基础设施自身的完整性检查,建议和第 1-7 节同步推进,而不是等功能全部做完再补——尤其是"回归锁"那几条,越早固化成自动化测试,后续加功能时越不容易踩到已经修过的坑。

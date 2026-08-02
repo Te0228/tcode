@@ -1,0 +1,217 @@
+#!/usr/bin/env node
+/**
+ * CLI entry point (spec §2). Presentation layer only: argument parsing,
+ * the readline REPL, and session load/save. All agent behavior lives in
+ * `agent.ts`, so swapping this for a TUI later touches nothing else.
+ */
+import path from "node:path";
+import readline from "node:readline";
+import { runTurn, type AgentDeps } from "./agent.js";
+import { createApprovalPolicy } from "./approval.js";
+import { loadConfig, loadEnvFiles, userConfigDir } from "./config.js";
+import { estimateTokens, formatTokens } from "./tokens.js";
+import { budgetWarning, computeBudget } from "./context.js";
+import { createSend, MissingApiKeyError, resolveProviderConfig } from "./llm/index.js";
+import { loadMemory } from "./memory.js";
+import { buildSystemPrompt } from "./prompt.js";
+import {
+  createSession,
+  findLatestSession,
+  loadSession,
+  saveSession,
+  type Session,
+} from "./session.js";
+import { createToolRegistry } from "./tools/spawn_agent.js";
+
+interface CliArgs {
+  continueLatest: boolean;
+  resumeId?: string;
+  fullAuto: boolean;
+}
+
+export function parseArgs(argv: string[]): CliArgs {
+  const args: CliArgs = { continueLatest: false, fullAuto: false };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--continue" || arg === "-c") {
+      args.continueLatest = true;
+    } else if (arg === "--resume") {
+      const id = argv[++i];
+      if (!id) throw new Error("--resume requires a session id");
+      args.resumeId = id;
+    } else if (arg === "--full-auto") {
+      args.fullAuto = true;
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+
+  return args;
+}
+
+function resolveSession(root: string, args: CliArgs, provider: string, model: string): Session {
+  if (args.resumeId) {
+    // Explicit id that doesn't exist is an error, never a silent new
+    // session — the user would lose track of which history they're in.
+    return loadSession(root, args.resumeId);
+  }
+
+  if (args.continueLatest) {
+    const latest = findLatestSession(root);
+    if (latest) return latest;
+    console.log("no previous session in this directory; starting a new one");
+  }
+
+  return createSession(root, provider, model);
+}
+
+async function main(): Promise<void> {
+  const root = path.resolve(process.cwd());
+  loadEnvFiles(root);
+
+  let args: CliArgs;
+  let providerConfig: ReturnType<typeof resolveProviderConfig>;
+  let session: Session;
+  try {
+    args = parseArgs(process.argv.slice(2));
+    // A missing API key for the active provider fails here, before the
+    // REPL opens (spec §8.2). A bad --resume id fails here too, rather
+    // than silently starting a fresh session (spec §4).
+    providerConfig = resolveProviderConfig();
+    session = resolveSession(root, args, providerConfig.provider, providerConfig.model);
+  } catch (error) {
+    console.error(`tcode: ${error instanceof Error ? error.message : String(error)}`);
+    if (error instanceof MissingApiKeyError) {
+      // Point at the user-level config rather than leaving them to guess
+      // where a globally installed CLI reads its key from (spec §8.2).
+      console.error(
+        `\nSet it in ${path.join(userConfigDir(), ".env")} (applies everywhere), ` +
+          `or in ${path.join(root, ".env")} for this project only:\n\n` +
+          `  ${error.envVar}=your-key-here\n`,
+      );
+    }
+    process.exit(1);
+  }
+
+  const config = loadConfig();
+
+  // A session created under another provider still replays fine — the
+  // history is normalized — so this is a notice, not an error (spec §4).
+  if (session.provider && session.provider !== providerConfig.provider) {
+    console.log(
+      `note: this session was created with ${session.provider}; continuing with ${providerConfig.provider}`,
+    );
+  }
+
+  const memory = loadMemory(root, config.memoryMaxTokens);
+  for (const layer of memory.layers) {
+    console.log(`loaded ${layer.scope} memory from ${layer.file}`);
+  }
+  if (memory.truncated) {
+    // Name what was dropped: "it was truncated" alone gives the user no
+    // way to know what to prune (spec §9.4).
+    console.log(
+      `warning: memory exceeded MEMORY_MAX_TOKENS; dropped ${memory.dropped.length} oldest entr${
+        memory.dropped.length === 1 ? "y" : "ies"
+      }:`,
+    );
+    for (const entry of memory.dropped) {
+      console.log(`  - (${entry.scope}) ${entry.preview}`);
+    }
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  const log = (line: string) => process.stdout.write(line.endsWith("\n") ? line : `${line}\n`);
+
+  // Ctrl+D / piped-stdin EOF closes readline; resolve to null so callers
+  // stop instead of questioning a closed interface (spec §2).
+  let closed = false;
+  rl.on("close", () => {
+    closed = true;
+  });
+
+  const ask = (question: string): Promise<string | null> =>
+    new Promise((resolve) => {
+      if (closed) {
+        resolve(null);
+        return;
+      }
+      const onClose = () => resolve(null);
+      rl.once("close", onClose);
+      rl.question(question, (answer) => {
+        rl.off("close", onClose);
+        resolve(answer);
+      });
+    });
+
+  const deps: AgentDeps = {
+    send: createSend(providerConfig),
+    approval: createApprovalPolicy({
+      fullAuto: args.fullAuto,
+      // Reuse the REPL's interface: a second readline on the same stdin
+      // swallows the answer and hangs. EOF counts as a decline — never
+      // run an unconfirmed command because input ran out.
+      prompt: async (question) => (await ask(question)) ?? "n",
+    }),
+    config,
+    root,
+    systemPrompt: buildSystemPrompt({ root, memory, fullAuto: args.fullAuto }),
+    contextWindowTokens: providerConfig.contextWindowTokens,
+  };
+  const tools = createToolRegistry(deps);
+
+  // Validate the budget once, at startup, before the user has typed
+  // anything — a silently-zero budget looks like a dumb model (spec §3.1).
+  const budgetInputs = {
+    contextWindowTokens: providerConfig.contextWindowTokens,
+    compactThreshold: config.compactThreshold,
+    reservedOutputTokens: config.reservedOutputTokens,
+    compactKeepRecent: config.compactKeepRecent,
+    systemPromptTokens: estimateTokens(deps.systemPrompt),
+  };
+  for (const line of budgetWarning(
+    computeBudget(budgetInputs),
+    budgetInputs,
+    config.minUsableHistoryTokens,
+    memory.tokens,
+  )) {
+    console.log(line);
+  }
+
+  console.log(`tcode · ${providerConfig.provider}/${providerConfig.model} · ${root}`);
+  console.log(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`);
+  console.log(`enter an empty line, "exit", or Ctrl+D to quit\n`);
+
+  while (true) {
+    const answer = await ask("› ");
+    if (answer === null) break;
+    const input = answer.trim();
+    if (!input || input === "exit" || input === "quit") break;
+
+    try {
+      const result = await runTurn(session, input, deps, { tools, log, persist: saveSession });
+      if (result.finish) {
+        const label = result.finish.status === "blocked" ? "⚠ blocked" : "✓ done";
+        log(`\n${label}: ${result.finish.summary}`);
+      }
+      // Context usage is never a surprise: show it every turn (spec §3.1).
+      log(
+        `\n[context ${formatTokens(result.usage.tokens)}/${formatTokens(result.usage.contextWindowTokens)}]\n`,
+      );
+    } catch (error) {
+      // Keep the REPL alive on an API/network failure — the session is
+      // still on disk and the user can retry.
+      console.error(`\nturn failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      saveSession(session);
+    }
+  }
+
+  rl.close();
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
