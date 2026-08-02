@@ -22,6 +22,8 @@ import {
   type Session,
 } from "./session.js";
 import { createToolRegistry } from "./tools/spawn_agent.js";
+import { isInterruptKey } from "./ui/keys.js";
+import { createLiveInput } from "./ui/live-input.js";
 import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
 import { startViewer } from "./viewer/server.js";
 
@@ -151,59 +153,21 @@ async function main(): Promise<void> {
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-  // Keeping typed input readable while the model streams (spec §3.2).
-  //
-  // Streamed text and the user's input share the terminal's last line, so
-  // without help they interleave into "Helabcloworld". The fix: while the
-  // user has something typed, hold partial output back and only emit
-  // complete lines, redrawing their input underneath. When nothing is
-  // typed — the normal case — output streams through untouched, so the
-  // live feel is preserved.
-  const isTTY = process.stdout.isTTY === true;
-  let heldOutput = "";
-  let midLine = false;
+  const PROMPT = "› ";
 
-  const userTyping = () => isTTY && rl.line.length > 0;
+  // The input line stays on screen for the whole turn, with output
+  // rendered above it (spec §3.2). Without this the prompt disappears the
+  // moment work starts and typed characters land inside the streamed
+  // output — input that is accepted but invisible reads as no input at all.
+  const live = createLiveInput({
+    write: (text) => process.stdout.write(text),
+    columns: () => process.stdout.columns ?? 80,
+    input: rl,
+    prompt: PROMPT,
+    isTTY: process.stdout.isTTY === true && process.stdin.isTTY === true,
+  });
 
-  const redrawInput = () => {
-    process.stdout.write(rl.line);
-    readline.cursorTo(process.stdout, rl.cursor);
-  };
-
-  const emitAboveInput = (text: string) => {
-    readline.cursorTo(process.stdout, 0);
-    readline.clearLine(process.stdout, 0);
-    process.stdout.write(text);
-    redrawInput();
-  };
-
-  const write = (text: string) => {
-    if (!userTyping()) {
-      if (heldOutput) {
-        process.stdout.write(heldOutput);
-        heldOutput = "";
-      }
-      process.stdout.write(text);
-      midLine = !text.endsWith("\n");
-      return;
-    }
-
-    // First output since they started typing: close off any partial line
-    // so their input gets a line of its own.
-    if (midLine) {
-      process.stdout.write("\n");
-      midLine = false;
-      redrawInput();
-    }
-
-    heldOutput += text;
-    const lastBreak = heldOutput.lastIndexOf("\n");
-    if (lastBreak >= 0) {
-      emitAboveInput(heldOutput.slice(0, lastBreak + 1));
-      heldOutput = heldOutput.slice(lastBreak + 1);
-    }
-  };
-
+  const write = (text: string) => live.write(text);
   const log = (line: string) => write(line.endsWith("\n") ? line : `${line}\n`);
 
   // Ctrl+D / piped-stdin EOF closes readline; resolve to null so callers
@@ -213,8 +177,12 @@ async function main(): Promise<void> {
     closed = true;
   });
 
+  // Always hands the terminal back first: readline is about to redraw its
+  // own block, and it does that by moving up from where it last left the
+  // cursor. Leaving a frame of ours in the way makes it erase real output.
   const ask = (question: string): Promise<string | null> =>
     new Promise((resolve) => {
+      live.stop();
       if (closed) {
         resolve(null);
         return;
@@ -235,7 +203,13 @@ async function main(): Promise<void> {
       // Reuse the REPL's interface: a second readline on the same stdin
       // swallows the answer and hangs. EOF counts as a decline — never
       // run an unconfirmed command because input ran out.
-      prompt: async (question) => (await ask(question)) ?? "n",
+      prompt: async (question) => {
+        const answer = await ask(question);
+        // The turn continues after the answer, so the input line goes back
+        // up — `ask` took it down.
+        live.start();
+        return answer ?? "n";
+      },
     }),
     config,
     root,
@@ -278,7 +252,10 @@ async function main(): Promise<void> {
 
   console.log(`tcode · ${providerConfig.provider}/${providerConfig.model} · ${root}`);
   console.log(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`);
-  console.log(`Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`);
+  console.log(
+    `type any time — input during a turn is queued for the next one\n` +
+      `Esc or Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`,
+  );
 
   // Input typed while a turn is running is queued for the next one, and
   // Ctrl+C interrupts that turn rather than killing the process (spec §3.2).
@@ -287,15 +264,12 @@ async function main(): Promise<void> {
 
   rl.on("line", (line) => {
     if (!controller) return; // Idle: `ask()` owns this line.
+    // readline has already echoed the line and moved past it, so the frame
+    // we were tracking is gone — tell the renderer before writing anything.
+    live.commitLine();
     const text = line.trim();
     if (!text) return;
     queued.push(text);
-    // The line is consumed; flush anything held back for it.
-    if (heldOutput) {
-      process.stdout.write(heldOutput);
-      heldOutput = "";
-      midLine = false;
-    }
     log(`⏎ queued (${queued.length}) — will send after this turn`);
   });
 
@@ -326,7 +300,7 @@ async function main(): Promise<void> {
   if (process.stdin.isTTY) {
     readline.emitKeypressEvents(process.stdin, rl);
     process.stdin.on("keypress", (_char, key) => {
-      if (!key || key.name !== "escape" || key.ctrl || key.meta || key.shift) return;
+      if (!isInterruptKey(key)) return;
       // Only meaningful while a turn is running; at the prompt, Esc is
       // part of ordinary line editing.
       if (controller && !controller.signal.aborted) onInterrupt();
@@ -337,15 +311,18 @@ async function main(): Promise<void> {
     // A queued message runs without re-prompting; otherwise wait for input.
     let input = queued.shift();
     if (input === undefined) {
-      const answer = await ask("› ");
+      const answer = await ask(PROMPT);
       if (answer === null) break;
       input = answer.trim();
     } else {
-      log(`› ${input}`);
+      // Still inside the previous turn's frame, so this echo renders above
+      // the input line like any other output.
+      log(`${PROMPT}${input}`);
     }
     if (!input || input === "exit" || input === "quit") break;
 
     controller = new AbortController();
+    live.start();
     try {
       const result = await runTurn(session, input, deps, {
         tools,
@@ -368,7 +345,9 @@ async function main(): Promise<void> {
       // still on disk and the user can retry.
       const message = error instanceof Error ? error.message : String(error);
       tracer.emit("error", { message });
-      console.error(`\nturn failed: ${message}\n`);
+      // Through `log`, not console.error: the input line is still drawn,
+      // and a raw write would land inside it.
+      log(`\nturn failed: ${message}\n`);
       saveSession(session);
     } finally {
       controller = null;
