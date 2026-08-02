@@ -304,7 +304,7 @@ async function main(): Promise<void> {
     // fire for one Ctrl+C, and `aborted` makes the second call a no-op.
     if (controller && !controller.signal.aborted) {
       controller.abort();
-      log(`\n⎋ interrupting after the current tool finishes… (Ctrl+C again to quit)`);
+      log(`\n⎋ interrupted — stopping the running command (press again to quit)`);
       return;
     }
     log("");
@@ -318,6 +318,20 @@ async function main(): Promise<void> {
   // data loss this feature exists to prevent (spec §3.2).
   rl.on("SIGINT", onInterrupt);
   process.on("SIGINT", onInterrupt);
+
+  // Esc is the de-facto interrupt key for this class of tool (spec §3.2).
+  // Ctrl+C stays as the fallback: some terminals swallow Esc, and Esc is
+  // also the prefix of ANSI escape sequences, so arrow keys travel the
+  // same path.
+  if (process.stdin.isTTY) {
+    readline.emitKeypressEvents(process.stdin, rl);
+    process.stdin.on("keypress", (_char, key) => {
+      if (!key || key.name !== "escape" || key.ctrl || key.meta || key.shift) return;
+      // Only meaningful while a turn is running; at the prompt, Esc is
+      // part of ordinary line editing.
+      if (controller && !controller.signal.aborted) onInterrupt();
+    });
+  }
 
   while (true) {
     // A queued message runs without re-prompting; otherwise wait for input.

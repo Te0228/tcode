@@ -111,6 +111,9 @@ export function createSpawnAgentTool(spawn: SpawnAgentDeps): Tool {
         // most interesting thing to visualize, and they never enter the
         // main session (spec §5.6/§13.1).
         tracer: context.tracer.child(),
+        // Interrupt the subagent too, or the main loop stops while the
+        // subagent keeps working (spec §3.2).
+        signal: context.signal,
       });
 
       if (pending) prefixed(pending);

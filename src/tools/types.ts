@@ -17,6 +17,8 @@ export interface ToolContext {
   /** Event log, so a tool that runs a nested agent can trace into it
    * (spec §13). Tools that don't need it can ignore it. */
   tracer: Tracer;
+  /** Interrupt signal (spec §3.2) — long-running tools should honour it. */
+  signal?: AbortSignal;
 }
 
 export interface Tool {

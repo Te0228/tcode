@@ -35,7 +35,20 @@ export const bashTool: Tool = {
     const command = requireString(input, "command");
     const timeoutMs = optionalNumber(input, "timeout_ms") ?? context.config.commandTimeoutMs;
 
-    const result = await executor.run(command, { cwd: context.root, timeoutMs });
+    const result = await executor.run(command, {
+      cwd: context.root,
+      timeoutMs,
+      signal: context.signal,
+    });
+
+    if (result.interrupted) {
+      // Not an error: the user asked for this, and the output collected so
+      // far is still worth keeping (spec §3.2).
+      return (
+        `[interrupted by user]\n` +
+        formatStreams(result.stdout, result.stderr, context.config.maxOutputChars)
+      );
+    }
 
     if (result.timedOut) {
       throw new ToolError(

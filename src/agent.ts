@@ -154,6 +154,7 @@ async function executeToolUse(
   deps: AgentDeps,
   log: (line: string) => void,
   tracer: Tracer,
+  signal: AbortSignal | undefined,
 ): Promise<ToolResultBlock> {
   const tool = tools[toolUse.name];
   if (!tool) {
@@ -175,6 +176,7 @@ async function executeToolUse(
       config: deps.config,
       log,
       tracer,
+      signal,
     });
     const content = truncateOutput(output, deps.config.maxOutputChars);
     tracer.emit("tool_result", {
@@ -341,7 +343,7 @@ export async function runTurn(
         }
       }
 
-      results.push(await executeToolUse(toolUse, tools, deps, log, tracer));
+      results.push(await executeToolUse(toolUse, tools, deps, log, tracer, options.signal));
     }
 
     // Close the history BEFORE deciding whether to break. A response can

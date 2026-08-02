@@ -139,3 +139,58 @@ describe("truncateOutput", () => {
     expect(truncated.length).toBeLessThan(text.length);
   });
 });
+
+describe("bash: interruption (spec §3.2)", () => {
+  it("kills the running command instead of waiting it out", async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 200);
+
+    const output = await bashTool.execute(
+      { command: "sleep 10" },
+      { ...context, signal: controller.signal },
+    );
+
+    // The whole point: without killing, this would take 10s.
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(output).toMatch(/interrupted by user/i);
+  });
+
+  it("keeps the output produced before the interrupt", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 600);
+
+    const output = await bashTool.execute(
+      { command: "echo early-output; sleep 10" },
+      { ...context, signal: controller.signal },
+    );
+
+    // "Claude keeps the work done so far" — an interrupt is not a discard.
+    expect(output).toContain("early-output");
+  });
+
+  it("is unaffected by a signal that never fires", async () => {
+    const controller = new AbortController();
+    const output = await bashTool.execute(
+      { command: "echo done" },
+      { ...context, signal: controller.signal },
+    );
+
+    expect(output).toContain("exit code: 0");
+    expect(output).toContain("done");
+  });
+
+  it("returns immediately when the signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const started = Date.now();
+
+    const output = await bashTool.execute(
+      { command: "sleep 10" },
+      { ...context, signal: controller.signal },
+    );
+
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(output).toMatch(/interrupted/i);
+  });
+});
