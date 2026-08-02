@@ -182,3 +182,39 @@ describe("createOpenAICompatSend: SSE streaming", () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe("steering: tool_result and user text in one normalized message (spec §3.2)", () => {
+  const steered = [
+    {
+      role: "assistant" as const,
+      content: [{ type: "tool_use" as const, id: "c1", name: "bash", input: {} }],
+    },
+    {
+      role: "user" as const,
+      content: [
+        { type: "tool_result" as const, toolUseId: "c1", content: "ok", isError: false },
+        { type: "text" as const, text: "actually, do X instead" },
+      ],
+    },
+  ];
+
+  it("emits the tool message before the user text, never after", () => {
+    // OpenAI rejects anything between an assistant `tool_calls` message and
+    // the `tool` messages answering it — with a 400, not a reordering.
+    // Block order in the normalized message must not decide wire order.
+    const wire = toOpenAIMessages(steered, "");
+    expect(wire.map((m) => m.role)).toEqual(["assistant", "tool", "user"]);
+    expect(wire[1]).toEqual({ role: "tool", tool_call_id: "c1", content: "ok" });
+    expect(wire[2]).toEqual({ role: "user", content: "actually, do X instead" });
+  });
+
+  it("answers every tool_call before any other message intervenes", () => {
+    const wire = toOpenAIMessages(steered, "");
+    const callIds = wire.flatMap((m) => (m.tool_calls ?? []).map((c) => c.id));
+    for (const id of callIds) {
+      const callIndex = wire.findIndex((m) => m.tool_calls?.some((c) => c.id === id));
+      const answerIndex = wire.findIndex((m) => m.tool_call_id === id);
+      expect(answerIndex).toBe(callIndex + 1);
+    }
+  });
+});

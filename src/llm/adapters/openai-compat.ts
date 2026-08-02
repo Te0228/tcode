@@ -46,14 +46,20 @@ export function toOpenAIMessages(messages: Message[], system: string): OpenAIMes
       continue;
     }
 
-    const text = textOf(message.content);
-    if (text) wire.push({ role: "user", content: text });
-
+    // Tool results first, text second, whatever order the blocks are in.
+    // OpenAI requires the `tool` messages to follow the assistant's
+    // `tool_calls` immediately — a `user` message slipped in between is a
+    // 400, not a reordering. Steering makes this reachable: it puts the
+    // user's mid-turn message in the same normalized message as the
+    // tool_results (spec §3.2).
     for (const block of message.content) {
       if (block.type === "tool_result") {
         wire.push({ role: "tool", tool_call_id: block.toolUseId, content: block.content });
       }
     }
+
+    const text = textOf(message.content);
+    if (text) wire.push({ role: "user", content: text });
   }
 
   return wire;

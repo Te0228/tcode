@@ -58,6 +58,11 @@ export interface RunTurnOptions {
   /** Cooperative interruption (spec §3.2). Aborting stops the loop from
    * issuing further LLM calls; it never abandons an in-flight tool batch. */
   signal?: AbortSignal;
+  /** Steering (spec §3.2): hands over anything the user typed while this
+   * turn was running, to be folded into it rather than held for the next
+   * one. Called once per iteration, at the only point where the history is
+   * closed. Returns the messages and clears the queue. */
+  drainInput?: () => string[];
 }
 
 export type TurnOutcome = "finished" | "no_tool_use" | "max_iterations" | "interrupted";
@@ -346,10 +351,33 @@ export async function runTurn(
       results.push(await executeToolUse(toolUse, tools, deps, log, tracer, options.signal));
     }
 
+    const finishUse = toolUses.find((toolUse) => toolUse.name === FINISH_TOOL_NAME);
+
+    // Steering (spec §3.2): fold anything typed during the batch into this
+    // turn instead of holding it for the next one. Skipped when the turn is
+    // already over — a message appended to a finished or interrupted turn
+    // is one nobody will answer, which is worse than a short wait.
+    const steering =
+      finishUse || options.signal?.aborted ? [] : (options.drainInput?.() ?? []);
+
     // Close the history BEFORE deciding whether to break. A response can
     // mix `finish` with other tool_uses; breaking early would leave a
     // dangling tool_use that makes the next `--continue` fail (spec §3).
-    session.messages.push({ role: "user", content: results });
+    const content: ContentBlock[] = [...results];
+    for (const message of steering) {
+      // Same message as the tool_results rather than a second user message:
+      // one fewer role alternation, and the prefix is what keeps the model
+      // from reading it as more tool output.
+      content.push({
+        type: "text",
+        text:
+          `[The user sent this while you were working. It is a new instruction — ` +
+          `where it conflicts with your current plan, follow this instead.]\n${message}`,
+      });
+      status(`↳ steering: ${message}`);
+      tracer.emit("steering", { message });
+    }
+    session.messages.push({ role: "user", content });
 
     // Checked only AFTER the batch's tool_results are pushed above: an
     // interrupt must still leave the history closed, or the next
@@ -359,7 +387,6 @@ export async function runTurn(
       break;
     }
 
-    const finishUse = toolUses.find((toolUse) => toolUse.name === FINISH_TOOL_NAME);
     if (finishUse) {
       outcome = "finished";
       finish = finishPayloadOf(finishUse.input);

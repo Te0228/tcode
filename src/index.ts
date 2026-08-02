@@ -253,7 +253,7 @@ async function main(): Promise<void> {
   console.log(`tcode · ${providerConfig.provider}/${providerConfig.model} · ${root}`);
   console.log(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`);
   console.log(
-    `type any time — input during a turn is queued for the next one\n` +
+    `type any time — a message sent during a turn joins that turn\n` +
       `Esc or Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`,
   );
 
@@ -270,7 +270,9 @@ async function main(): Promise<void> {
     const text = line.trim();
     if (!text) return;
     queued.push(text);
-    log(`⏎ queued (${queued.length}) — will send after this turn`);
+    // "next step", not "after this turn": it joins the running turn as soon
+    // as the current batch of tools finishes (spec §3.2).
+    log(`⏎ queued (${queued.length}) — joins this turn at the next step`);
   });
 
   const onInterrupt = () => {
@@ -331,6 +333,10 @@ async function main(): Promise<void> {
         persist: saveSession,
         tracer,
         signal: controller.signal,
+        // Steering (spec §3.2). Whatever is left over — queued during the
+        // batch that called `finish` — falls through to the next turn via
+        // the loop above.
+        drainInput: () => queued.splice(0),
       });
       if (result.finish) {
         const label = result.finish.status === "blocked" ? "⚠ blocked" : "✓ done";

@@ -732,3 +732,127 @@ describe("interruption (spec §3.2)", () => {
     expect(result.outcome).toBe("no_tool_use");
   });
 });
+
+describe("scenario 9: steering — input typed during the turn joins it (spec §3.2)", () => {
+  const echo = fakeTool("echo", async (input) => String(input.value ?? ""));
+
+  it("appends the message to the tool_result that closes the batch", async () => {
+    const { send, calls } = fakeSend([
+      toolResponse(use("echo", "e1", { value: "first" })),
+      toolResponse(use("finish", "f1", { summary: "ok", status: "done" })),
+    ]);
+    const s = session();
+    let typed = ["wait, check the config first"];
+
+    const result = await runTurn(s, "go", deps(send), {
+      tools: { echo, finish: finishStub },
+      log: () => {},
+      persist: noopPersist,
+      drainInput: () => typed.splice(0),
+    });
+
+    expect(result.outcome).toBe("finished");
+
+    // One user message, carrying both the tool_result and the steer: a
+    // second message would add a role alternation for no reason.
+    const closing = s.messages[2];
+    expect(closing.role).toBe("user");
+    expect(closing.content.map((block) => block.type)).toEqual(["tool_result", "text"]);
+    expect(JSON.stringify(closing.content[1])).toMatch(/check the config first/);
+
+    // And the model actually saw it before deciding what to do next.
+    expect(JSON.stringify(calls[1].messages)).toMatch(/check the config first/);
+  });
+
+  it("labels the message so it cannot be read as tool output", async () => {
+    const { send } = fakeSend([
+      toolResponse(use("echo", "e1", {})),
+      textResponse("ok"),
+    ]);
+    const s = session();
+
+    await runTurn(s, "go", deps(send), {
+      tools: { echo },
+      log: () => {},
+      persist: noopPersist,
+      drainInput: () => ["pivot to X"],
+    });
+
+    const text = JSON.stringify(s.messages[2].content[1]);
+    expect(text).toMatch(/The user sent this while you were working/);
+    expect(text).toMatch(/follow this instead/);
+  });
+
+  it("holds the message back when the batch called finish", async () => {
+    // The turn is over; injecting here would leave a user message that
+    // nothing in this turn will ever answer.
+    const { send } = fakeSend([
+      toolResponse(use("finish", "f1", { summary: "done", status: "done" })),
+    ]);
+    const s = session();
+    const typed = ["one more thing"];
+
+    const result = await runTurn(s, "go", deps(send), {
+      tools: { finish: finishStub },
+      log: () => {},
+      persist: noopPersist,
+      drainInput: () => typed.splice(0),
+    });
+
+    expect(result.outcome).toBe("finished");
+    expect(JSON.stringify(s.messages)).not.toMatch(/one more thing/);
+    // Still queued, so the REPL sends it as the next turn.
+    expect(typed).toEqual(["one more thing"]);
+  });
+
+  it("holds the message back when the turn was interrupted", async () => {
+    const controller = new AbortController();
+    const { send } = fakeSend([toolResponse(use("echo", "e1", {}))]);
+    const s = session();
+    const typed = ["one more thing"];
+
+    const result = await runTurn(s, "go", deps(send), {
+      tools: {
+        echo: fakeTool("echo", async () => {
+          controller.abort();
+          return "done";
+        }),
+      },
+      log: () => {},
+      persist: noopPersist,
+      signal: controller.signal,
+      drainInput: () => typed.splice(0),
+    });
+
+    expect(result.outcome).toBe("interrupted");
+    expect(JSON.stringify(s.messages)).not.toMatch(/one more thing/);
+    expect(typed).toEqual(["one more thing"]);
+  });
+
+  it("leaves the history closed with steering in play", async () => {
+    const { send } = fakeSend([
+      toolResponse(use("echo", "e1", {}), use("echo", "e2", {})),
+      toolResponse(use("echo", "e3", {})),
+      textResponse("done"),
+    ]);
+    const s = session();
+
+    await runTurn(s, "go", deps(send), {
+      tools: { echo },
+      log: () => {},
+      persist: noopPersist,
+      drainInput: () => ["steer me"],
+    });
+
+    expect(danglingToolUseIds(s.messages)).toEqual([]);
+  });
+
+  it("is inert when the REPL provides no queue — subagents get no steering", async () => {
+    const { send } = fakeSend([toolResponse(use("echo", "e1", {})), textResponse("ok")]);
+    const s = session();
+
+    await runTurn(s, "go", deps(send), { tools: { echo }, log: () => {}, persist: noopPersist });
+
+    expect(s.messages[2].content.map((block) => block.type)).toEqual(["tool_result"]);
+  });
+});
