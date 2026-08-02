@@ -55,9 +55,12 @@ export interface RunTurnOptions {
   /** Event log (spec §13). Subagents get `tracer.child()` so their steps
    * land in the same file one level deeper. */
   tracer?: Tracer;
+  /** Cooperative interruption (spec §3.2). Aborting stops the loop from
+   * issuing further LLM calls; it never abandons an in-flight tool batch. */
+  signal?: AbortSignal;
 }
 
-export type TurnOutcome = "finished" | "no_tool_use" | "max_iterations";
+export type TurnOutcome = "finished" | "no_tool_use" | "max_iterations" | "interrupted";
 
 export interface TurnResult {
   outcome: TurnOutcome;
@@ -244,6 +247,11 @@ export async function runTurn(
   let announcedOmission = false;
 
   for (let iteration = 0; iteration < deps.config.maxToolIterations; iteration++) {
+    if (options.signal?.aborted) {
+      outcome = "interrupted";
+      break;
+    }
+
     // Build the view fresh each round: session.messages is the untouched
     // truth, this is only what we send (spec §3.1).
     let view = buildSendView(session, budget);
@@ -341,6 +349,14 @@ export async function runTurn(
     // dangling tool_use that makes the next `--continue` fail (spec §3).
     session.messages.push({ role: "user", content: results });
 
+    // Checked only AFTER the batch's tool_results are pushed above: an
+    // interrupt must still leave the history closed, or the next
+    // --continue fails on a dangling tool_use (spec §3.2).
+    if (options.signal?.aborted) {
+      outcome = "interrupted";
+      break;
+    }
+
     const finishUse = toolUses.find((toolUse) => toolUse.name === FINISH_TOOL_NAME);
     if (finishUse) {
       outcome = "finished";
@@ -349,7 +365,15 @@ export async function runTurn(
     }
   }
 
-  if (outcome === "max_iterations") {
+  if (outcome === "interrupted") {
+    // Tell the model, in-band, that the user cut this turn short —
+    // otherwise the next turn looks like the work simply stopped.
+    session.messages.push({
+      role: "user",
+      content: [{ type: "text", text: "[The user interrupted this turn before it finished.]" }],
+    });
+    status("⎋ interrupted");
+  } else if (outcome === "max_iterations") {
     status(
       `⚠ stopped after ${deps.config.maxToolIterations} tool iterations without finishing. ` +
         `Send another message to continue.`,

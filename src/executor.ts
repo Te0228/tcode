@@ -1,10 +1,15 @@
 /**
- * Command execution boundary (spec §5.1/§7). v1 is a thin `spawnSync`
- * wrapper; swapping in a sandboxed executor (seatbelt/landlock/container)
- * later means replacing this file only — tools never touch child_process
+ * Command execution boundary (spec §5.1/§7). A thin `spawn` wrapper;
+ * swapping in a sandboxed executor (seatbelt/landlock/container) later
+ * means replacing this file only — tools never touch child_process
  * directly.
+ *
+ * Asynchronous by requirement, not by taste: `spawnSync` blocks the event
+ * loop, so signal handlers cannot run while a command is in flight. With
+ * it, Ctrl+C produced no visible response until the command finished on
+ * its own — making the interrupt in spec §3.2 useless in practice.
  */
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 export interface RunOptions {
   cwd: string;
@@ -20,39 +25,69 @@ export interface RunResult {
 }
 
 export interface Executor {
-  run(command: string, options: RunOptions): RunResult;
+  run(command: string, options: RunOptions): Promise<RunResult>;
 }
+
+/** Guard against a runaway command exhausting memory. */
+const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
 
 export const executor: Executor = {
   run(command, options) {
-    const result = spawnSync(command, {
-      shell: true,
-      cwd: options.cwd,
-      timeout: options.timeoutMs,
-      encoding: "utf8",
-      maxBuffer: 32 * 1024 * 1024,
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, {
+        shell: true,
+        cwd: options.cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let settled = false;
+
+      const capture = (chunk: Buffer, into: "out" | "err") => {
+        const text = chunk.toString("utf8");
+        if (into === "out") {
+          if (stdout.length < MAX_CAPTURE_BYTES) stdout += text;
+        } else if (stderr.length < MAX_CAPTURE_BYTES) {
+          stderr += text;
+        }
+      };
+
+      child.stdout?.on("data", (chunk: Buffer) => capture(chunk, "out"));
+      child.stderr?.on("data", (chunk: Buffer) => capture(chunk, "err"));
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        // SIGKILL after a grace period: a shell ignoring SIGTERM must not
+        // hold the turn open past its timeout.
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 2000).unref();
+      }, options.timeoutMs);
+
+      child.on("error", (error) => {
+        // A spawn failure that isn't a timeout (e.g. missing shell) is a
+        // real fault — surface it so the tool layer turns it into an
+        // is_error tool_result rather than a bogus exit code.
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      });
+
+      child.on("close", (code, signal) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          stdout,
+          stderr,
+          // A signal-killed process has a null code; don't let that read
+          // as success. 124 matches the coreutils `timeout` convention.
+          exitCode: code ?? (timedOut ? 124 : signal ? 1 : 0),
+          timedOut,
+        });
+      });
     });
-
-    // spawnSync reports a timeout kill as an ETIMEDOUT error plus a
-    // SIGTERM signal; either one on its own is enough to call it a timeout.
-    const timedOut =
-      (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" ||
-      result.signal === "SIGTERM";
-
-    // A spawn failure that isn't a timeout (e.g. shell missing) is a real
-    // fault — let it throw so the tool layer turns it into an is_error
-    // tool_result rather than reporting a bogus exit code.
-    if (result.error && !timedOut) {
-      throw result.error;
-    }
-
-    return {
-      stdout: result.stdout ?? "",
-      stderr: result.stderr ?? "",
-      // Signal-killed processes have a null status; don't let that read as
-      // success. 124 matches coreutils `timeout` convention.
-      exitCode: result.status ?? (timedOut ? 124 : 1),
-      timedOut,
-    };
   },
 };

@@ -92,10 +92,22 @@ describe("bash", () => {
     expect(output).toContain("marker.txt");
   });
 
-  it("errors on timeout instead of hanging", () => {
-    expect(() => bashTool.execute({ command: "sleep 5", timeout_ms: 150 }, context)).toThrow(
-      /timed out/i,
-    );
+  it("errors on timeout instead of hanging", async () => {
+    await expect(
+      bashTool.execute({ command: "sleep 5", timeout_ms: 150 }, context),
+    ).rejects.toThrow(/timed out/i);
+  });
+
+  it("does not block the event loop while a command runs", async () => {
+    // The whole reason the executor is async: a blocking one prevents the
+    // SIGINT handler from running, so Ctrl+C does nothing until the
+    // command finishes (spec §5.1/§3.2).
+    let ticked = false;
+    setTimeout(() => { ticked = true; }, 20);
+
+    await bashTool.execute({ command: "sleep 0.3" }, context);
+
+    expect(ticked).toBe(true);
   });
 });
 

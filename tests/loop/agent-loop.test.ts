@@ -628,3 +628,107 @@ describe("scenario 8: spawn_agent", () => {
     expect(spawnResult.isError).toBe(false);
   });
 });
+
+describe("interruption (spec §3.2)", () => {
+  it("stops issuing further LLM calls once aborted", async () => {
+    const controller = new AbortController();
+    const tools: ToolRegistry = {
+      bash: fakeTool("bash", () => {
+        controller.abort(); // user hits Ctrl+C while the tool runs
+        return "ok";
+      }),
+    };
+
+    const { send, calls } = fakeSend([
+      toolResponse(use("bash", "b1")),
+      toolResponse(use("bash", "b2")),
+      textResponse("never reached"),
+    ]);
+    const s = session();
+
+    const result = await runTurn(s, "do things", deps(send), {
+      tools,
+      log: () => {},
+      persist: noopPersist,
+      signal: controller.signal,
+    });
+
+    expect(result.outcome).toBe("interrupted");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("REGRESSION: finishes the in-flight tool batch so history stays closed", async () => {
+    const controller = new AbortController();
+    const executed: string[] = [];
+    const tools: ToolRegistry = {
+      read_file: fakeTool("read_file", () => {
+        executed.push("read_file");
+        controller.abort(); // abort mid-batch
+        return "contents";
+      }),
+      bash: fakeTool("bash", () => {
+        executed.push("bash");
+        return "ok";
+      }),
+    };
+
+    const { send } = fakeSend([toolResponse(use("read_file", "r1"), use("bash", "b1"))]);
+    const s = session();
+
+    await runTurn(s, "two tools", deps(send), {
+      tools,
+      log: () => {},
+      persist: noopPersist,
+      signal: controller.signal,
+    });
+
+    // Both tools ran and both results were refilled: an interrupt must not
+    // leave a dangling tool_use, same rule as `finish` (spec §3/§3.2).
+    expect(executed).toEqual(["read_file", "bash"]);
+    expect(danglingToolUseIds(s.messages)).toEqual([]);
+  });
+
+  it("persists the session so an interrupted turn is not lost", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const persisted = vi.fn();
+
+    const { send } = fakeSend([textResponse("unused")]);
+    const s = session();
+
+    await runTurn(s, "interrupted immediately", deps(send), {
+      log: () => {},
+      persist: persisted,
+      signal: controller.signal,
+    });
+
+    expect(persisted).toHaveBeenCalledOnce();
+    // The user's message survives even though nothing else happened.
+    expect(JSON.stringify(s.messages)).toContain("interrupted immediately");
+  });
+
+  it("tells the model the turn was cut short", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const { send } = fakeSend([textResponse("unused")]);
+    const s = session();
+
+    await runTurn(s, "stop", deps(send), { log: () => {}, persist: noopPersist, signal: controller.signal });
+
+    expect(JSON.stringify(s.messages.at(-1))).toMatch(/interrupted this turn/i);
+  });
+
+  it("runs normally when the signal is never aborted", async () => {
+    const controller = new AbortController();
+    const { send } = fakeSend([textResponse("all good")]);
+
+    const result = await runTurn(session(), "hi", deps(send), {
+      log: () => {},
+      persist: noopPersist,
+      signal: controller.signal,
+    });
+
+    expect(result.outcome).toBe("no_tool_use");
+  });
+});

@@ -31,11 +31,11 @@ export const bashTool: Tool = {
     },
   },
 
-  execute(input, context) {
+  async execute(input, context) {
     const command = requireString(input, "command");
     const timeoutMs = optionalNumber(input, "timeout_ms") ?? context.config.commandTimeoutMs;
 
-    const result = executor.run(command, { cwd: context.root, timeoutMs });
+    const result = await executor.run(command, { cwd: context.root, timeoutMs });
 
     if (result.timedOut) {
       throw new ToolError(

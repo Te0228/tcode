@@ -177,6 +177,7 @@ async function main(): Promise<void> {
   const deps: AgentDeps = {
     send: createSend(providerConfig),
     approval: createApprovalPolicy({
+      root,
       fullAuto: args.fullAuto,
       // Reuse the REPL's interface: a second readline on the same stdin
       // swallows the answer and hangs. EOF counts as a decline — never
@@ -224,20 +225,61 @@ async function main(): Promise<void> {
 
   console.log(`tcode · ${providerConfig.provider}/${providerConfig.model} · ${root}`);
   console.log(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`);
-  console.log(`enter an empty line, "exit", or Ctrl+D to quit\n`);
+  console.log(`Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`);
+
+  // Input typed while a turn is running is queued for the next one, and
+  // Ctrl+C interrupts that turn rather than killing the process (spec §3.2).
+  const queued: string[] = [];
+  let controller: AbortController | null = null;
+
+  rl.on("line", (line) => {
+    if (!controller) return; // Idle: `ask()` owns this line.
+    const text = line.trim();
+    if (!text) return;
+    queued.push(text);
+    log(`⏎ queued (${queued.length}) — will send after this turn`);
+  });
+
+  const onInterrupt = () => {
+    // Idempotent: readline (TTY) and the process handler (pipes) can both
+    // fire for one Ctrl+C, and `aborted` makes the second call a no-op.
+    if (controller && !controller.signal.aborted) {
+      controller.abort();
+      log(`\n⎋ interrupting after the current tool finishes… (Ctrl+C again to quit)`);
+      return;
+    }
+    log("");
+    rl.close();
+    process.exit(0);
+  };
+
+  // readline only emits SIGINT when stdin is a TTY. Without the process
+  // handler, a piped stdin falls through to the default action — the
+  // process dies mid-turn and the whole turn is lost, which is the exact
+  // data loss this feature exists to prevent (spec §3.2).
+  rl.on("SIGINT", onInterrupt);
+  process.on("SIGINT", onInterrupt);
 
   while (true) {
-    const answer = await ask("› ");
-    if (answer === null) break;
-    const input = answer.trim();
+    // A queued message runs without re-prompting; otherwise wait for input.
+    let input = queued.shift();
+    if (input === undefined) {
+      const answer = await ask("› ");
+      if (answer === null) break;
+      input = answer.trim();
+    } else {
+      log(`› ${input}`);
+    }
     if (!input || input === "exit" || input === "quit") break;
 
+    controller = new AbortController();
     try {
       const result = await runTurn(session, input, deps, {
         tools,
         log,
         persist: saveSession,
         tracer,
+        signal: controller.signal,
       });
       if (result.finish) {
         const label = result.finish.status === "blocked" ? "⚠ blocked" : "✓ done";
@@ -254,6 +296,8 @@ async function main(): Promise<void> {
       tracer.emit("error", { message });
       console.error(`\nturn failed: ${message}\n`);
       saveSession(session);
+    } finally {
+      controller = null;
     }
   }
 
