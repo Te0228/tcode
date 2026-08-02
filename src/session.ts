@@ -74,16 +74,58 @@ export function loadSession(cwd: string, id: string): Session {
 /** Returns the session with the most recent `updatedAt`, or undefined if
  * none exist yet (spec §4 `--continue`). */
 export function findLatestSession(cwd: string): Session | undefined {
-  const dir = sessionsDir(cwd);
-  if (!fs.existsSync(dir)) return undefined;
+  return listSessions(cwd)[0]?.session;
+}
 
-  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-  let latest: Session | undefined;
-  for (const file of files) {
-    const session = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")) as Session;
-    if (!latest || session.updatedAt > latest.updatedAt) {
-      latest = session;
+/** One row of `tcode sessions` (spec §4). */
+export interface SessionSummary {
+  session: Session;
+  /** First thing the user typed — the only human-readable handle on a
+   * session whose id is a timestamp and a random suffix. */
+  firstInput: string;
+  /** User + assistant messages, excluding the tool_result carriers, so the
+   * number reads as "how much conversation" rather than "how much plumbing". */
+  exchanges: number;
+}
+
+/**
+ * Every session in `cwd`, newest first (spec §4).
+ *
+ * Unreadable or half-written files are skipped rather than thrown on: one
+ * corrupt file must not make the whole list — or `--continue`, which is
+ * built on this — unusable.
+ */
+export function listSessions(cwd: string): SessionSummary[] {
+  const dir = sessionsDir(cwd);
+  if (!fs.existsSync(dir)) return [];
+
+  const summaries: SessionSummary[] = [];
+  for (const file of fs.readdirSync(dir).filter((name) => name.endsWith(".json"))) {
+    let session: Session;
+    try {
+      session = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")) as Session;
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(session.messages)) continue;
+    summaries.push({
+      session,
+      firstInput: firstUserTextOf(session),
+      exchanges: session.messages.filter(
+        (message) => !message.content.some((block) => block.type === "tool_result"),
+      ).length,
+    });
+  }
+
+  return summaries.sort((a, b) => b.session.updatedAt.localeCompare(a.session.updatedAt));
+}
+
+function firstUserTextOf(session: Session): string {
+  for (const message of session.messages) {
+    if (message.role !== "user") continue;
+    for (const block of message.content) {
+      if (block.type === "text" && block.text.trim()) return block.text.trim();
     }
   }
-  return latest;
+  return "";
 }

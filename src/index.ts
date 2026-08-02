@@ -17,6 +17,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import {
   createSession,
   findLatestSession,
+  listSessions,
   loadSession,
   saveSession,
   type Session,
@@ -33,14 +34,20 @@ interface CliArgs {
   fullAuto: boolean;
   /** `--view [id]`: open the read-only trace viewer (spec §13.4). */
   view?: { sessionId?: string };
+  /** `tcode sessions`: print the list and exit (spec §4). */
+  listSessions: boolean;
 }
 
 export function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { continueLatest: false, fullAuto: false };
+  const args: CliArgs = { continueLatest: false, fullAuto: false, listSessions: false };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--continue" || arg === "-c") {
+    if (arg === "sessions") {
+      // A subcommand, not a flag: it doesn't modify how this run behaves,
+      // it replaces the run entirely — print and exit, never reach the REPL.
+      args.listSessions = true;
+    } else if (arg === "--continue" || arg === "-c") {
       args.continueLatest = true;
     } else if (arg === "--resume") {
       const id = argv[++i];
@@ -77,6 +84,46 @@ function resolveSession(root: string, args: CliArgs, provider: string, model: st
   return createSession(root, provider, model);
 }
 
+/** Local time, minute precision — a session list is read at a glance, and
+ * an ISO string with milliseconds is not glanceable. */
+function formatWhen(iso: string): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return iso;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ` +
+    `${pad(at.getHours())}:${pad(at.getMinutes())}`
+  );
+}
+
+/** `tcode sessions` (spec §4): newest first, then exit. */
+function runSessionList(root: string): void {
+  const sessions = listSessions(root);
+  if (sessions.length === 0) {
+    console.log(`no sessions yet in ${root}`);
+    return;
+  }
+
+  console.log(`${sessions.length} session${sessions.length === 1 ? "" : "s"} in ${root}\n`);
+  for (const [index, { session, firstInput, exchanges }] of sessions.entries()) {
+    // The newest is what `--continue` picks; say so rather than making the
+    // user infer it from the ordering.
+    const marker = index === 0 ? " ← --continue" : "";
+    console.log(`${formatWhen(session.updatedAt)}  ${session.id}${marker}`);
+    console.log(
+      `  ${exchanges} message${exchanges === 1 ? "" : "s"} · ${session.provider}/${session.model}` +
+        `${firstInput ? `\n  ${truncateForList(firstInput)}` : ""}\n`,
+    );
+  }
+  console.log(`resume one with:  tcode --resume <id>`);
+}
+
+/** First line only, and short: the list is an index, not a transcript. */
+function truncateForList(text: string): string {
+  const line = text.split("\n")[0];
+  return line.length > 72 ? `${line.slice(0, 71)}…` : line;
+}
+
 /** `--view` path (spec §13.4): serve the trace and exit only on Ctrl+C.
  * Deliberately does not resolve a provider — viewing needs no API key. */
 async function runViewer(root: string, sessionId?: string): Promise<void> {
@@ -101,6 +148,10 @@ async function main(): Promise<void> {
   let session: Session;
   try {
     args = parseArgs(process.argv.slice(2));
+    if (args.listSessions) {
+      runSessionList(root);
+      return;
+    }
     // A missing API key for the active provider fails here, before the
     // REPL opens (spec §8.2). A bad --resume id fails here too, rather
     // than silently starting a fresh session (spec §4).
@@ -252,6 +303,20 @@ async function main(): Promise<void> {
 
   console.log(`tcode · ${providerConfig.provider}/${providerConfig.model} · ${root}`);
   console.log(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`);
+
+  // Starting fresh on top of existing history is the one case worth a nudge
+  // (spec §4). Resuming works fine; nobody could tell it was there, so every
+  // restart quietly began from zero.
+  if (!args.continueLatest && !args.resumeId) {
+    const previous = listSessions(root).find((entry) => entry.session.id !== session.id);
+    if (previous) {
+      console.log(
+        `\n${previous.exchanges} message${previous.exchanges === 1 ? "" : "s"} of history here ` +
+          `from ${formatWhen(previous.session.updatedAt)} — this session starts empty.\n` +
+          `  tcode --continue   resume it        tcode sessions   list all`,
+      );
+    }
+  }
   console.log(
     `type any time — a message sent during a turn joins that turn\n` +
       `Esc or Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`,

@@ -111,6 +111,11 @@
 - [x] `messages` 落盘为归一化内部格式(不是某个 provider 的原始 wire 格式)
 - [x] session JSON 里 `provider`/`model` 字段与实际使用的 provider/model 一致
 - [x] `--continue` 选中的确实是 `updatedAt` 最新的文件(有多个 session 时验证)
+- [x] `tcode sessions` 列出当前目录全部会话,按时间倒序,标出 `--continue` 会选中哪一条
+- [x] 列表里的消息数不含 `tool_result` 载体消息(数的是对话,不是管道)
+- [x] 单个损坏/半截写入的 session 文件被跳过,不会让整个列表和 `--continue` 一起失效
+- [x] 目录下有历史会话且没带恢复参数时,启动横幅多打一行告诉用户怎么接上;干净目录不打
+- [x] `tcode --continue` 实跑:上一轮让它记住一个数字,重进后能答出来
 
 ## 7. 项目级记忆(§9)
 
