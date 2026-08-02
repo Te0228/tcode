@@ -151,7 +151,60 @@ async function main(): Promise<void> {
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-  const log = (line: string) => process.stdout.write(line.endsWith("\n") ? line : `${line}\n`);
+  // Keeping typed input readable while the model streams (spec §3.2).
+  //
+  // Streamed text and the user's input share the terminal's last line, so
+  // without help they interleave into "Helabcloworld". The fix: while the
+  // user has something typed, hold partial output back and only emit
+  // complete lines, redrawing their input underneath. When nothing is
+  // typed — the normal case — output streams through untouched, so the
+  // live feel is preserved.
+  const isTTY = process.stdout.isTTY === true;
+  let heldOutput = "";
+  let midLine = false;
+
+  const userTyping = () => isTTY && rl.line.length > 0;
+
+  const redrawInput = () => {
+    process.stdout.write(rl.line);
+    readline.cursorTo(process.stdout, rl.cursor);
+  };
+
+  const emitAboveInput = (text: string) => {
+    readline.cursorTo(process.stdout, 0);
+    readline.clearLine(process.stdout, 0);
+    process.stdout.write(text);
+    redrawInput();
+  };
+
+  const write = (text: string) => {
+    if (!userTyping()) {
+      if (heldOutput) {
+        process.stdout.write(heldOutput);
+        heldOutput = "";
+      }
+      process.stdout.write(text);
+      midLine = !text.endsWith("\n");
+      return;
+    }
+
+    // First output since they started typing: close off any partial line
+    // so their input gets a line of its own.
+    if (midLine) {
+      process.stdout.write("\n");
+      midLine = false;
+      redrawInput();
+    }
+
+    heldOutput += text;
+    const lastBreak = heldOutput.lastIndexOf("\n");
+    if (lastBreak >= 0) {
+      emitAboveInput(heldOutput.slice(0, lastBreak + 1));
+      heldOutput = heldOutput.slice(lastBreak + 1);
+    }
+  };
+
+  const log = (line: string) => write(line.endsWith("\n") ? line : `${line}\n`);
 
   // Ctrl+D / piped-stdin EOF closes readline; resolve to null so callers
   // stop instead of questioning a closed interface (spec §2).
@@ -237,6 +290,12 @@ async function main(): Promise<void> {
     const text = line.trim();
     if (!text) return;
     queued.push(text);
+    // The line is consumed; flush anything held back for it.
+    if (heldOutput) {
+      process.stdout.write(heldOutput);
+      heldOutput = "";
+      midLine = false;
+    }
     log(`⏎ queued (${queued.length}) — will send after this turn`);
   });
 
@@ -277,6 +336,7 @@ async function main(): Promise<void> {
       const result = await runTurn(session, input, deps, {
         tools,
         log,
+        writeText: write,
         persist: saveSession,
         tracer,
         signal: controller.signal,
