@@ -253,10 +253,26 @@ export async function runTurn(
   let lastViewTokens = 0;
   let announcedOmission = false;
 
-  for (let iteration = 0; iteration < deps.config.maxToolIterations; iteration++) {
+  // Unbounded by default (spec §3). The old hard cap severed legitimate
+  // long tasks — a whole-project migration is dozens of rounds of real
+  // work — and never caught the loops it was aimed at, which fill the
+  // budget just as happily. Esc, steering and compaction are the brakes
+  // now; `maxToolIterations` stays as an opt-in ceiling for unattended runs.
+  const ceiling = deps.config.maxToolIterations;
+  const progressEvery = deps.config.progressEveryIterations;
+
+  for (let iteration = 0; ceiling === 0 || iteration < ceiling; iteration++) {
     if (options.signal?.aborted) {
       outcome = "interrupted";
       break;
+    }
+
+    // What replaced the cap: a long turn should be visible, not severed.
+    if (progressEvery > 0 && iteration > 0 && iteration % progressEvery === 0) {
+      status(
+        `⋯ still working — ${iteration} tool rounds, ` +
+          `context ${formatTokens(lastViewTokens)}/${formatTokens(budget.contextWindowTokens)} · Esc to stop`,
+      );
     }
 
     // Build the view fresh each round: session.messages is the untouched
@@ -404,7 +420,7 @@ export async function runTurn(
     status("⎋ interrupted");
   } else if (outcome === "max_iterations") {
     status(
-      `⚠ stopped after ${deps.config.maxToolIterations} tool iterations without finishing. ` +
+      `⚠ hit the configured MAX_TOOL_ITERATIONS ceiling (${ceiling}) without finishing. ` +
         `Send another message to continue.`,
     );
   } else if (textOpen) {

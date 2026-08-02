@@ -13,6 +13,7 @@ describe("loadConfig", () => {
     expect(
       loadConfig({
         MAX_TOOL_ITERATIONS: "10",
+        PROGRESS_EVERY_ITERATIONS: "5",
         COMMAND_TIMEOUT_MS: "5000",
         MAX_OUTPUT_CHARS: "100",
         COMPACT_THRESHOLD: "0.5",
@@ -23,6 +24,7 @@ describe("loadConfig", () => {
       }),
     ).toEqual({
       maxToolIterations: 10,
+      progressEveryIterations: 5,
       commandTimeoutMs: 5000,
       maxOutputChars: 100,
       compactThreshold: 0.5,
@@ -33,7 +35,7 @@ describe("loadConfig", () => {
     });
   });
 
-  it.each(["0", "-1", "abc", ""])(
+  it.each(["-1", "abc", ""])(
     "falls back to the default for invalid value %j instead of failing startup",
     (raw) => {
       expect(loadConfig({ MAX_TOOL_ITERATIONS: raw }).maxToolIterations).toBe(
@@ -41,6 +43,19 @@ describe("loadConfig", () => {
       );
     },
   );
+
+  it("defaults to no ceiling at all (spec §3)", () => {
+    // 0 means unlimited, and it is the default: the old hard cap severed
+    // legitimate long tasks. Esc is the brake for interactive use; this
+    // knob exists for unattended runs.
+    expect(DEFAULT_CONFIG.maxToolIterations).toBe(0);
+    expect(loadConfig({}).maxToolIterations).toBe(0);
+  });
+
+  it("treats an explicit 0 as 'no ceiling', not as an invalid value", () => {
+    expect(loadConfig({ MAX_TOOL_ITERATIONS: "0" }).maxToolIterations).toBe(0);
+    expect(loadConfig({ PROGRESS_EVERY_ITERATIONS: "0" }).progressEveryIterations).toBe(0);
+  });
 });
 
 describe("COMPACT_THRESHOLD", () => {

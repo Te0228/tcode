@@ -27,7 +27,9 @@
 - [x] **回归锁**:`finish` 与其他 tool_use 混在同一响应 → 全部执行、`tool_result` 全部回填、消息历史闭合;之后模拟一次 `--continue` 追加新 user 消息,不因为悬空 tool_use 报错
 - [x] 工具执行抛错 → `is_error: true` 回填给模型,loop 不崩溃,模型能继续下一轮
 - [x] 用户对 `bash` 拒绝确认(输入 n)→ 回填"用户拒绝"的 `is_error` 结果,不执行命令,loop 继续
-- [x] 连续 `MAX_TOOL_ITERATIONS` 次都返回 tool_use、不返回 `finish` → 强制中断并打印提示,session 仍完整可保存
+- [x] **默认不设工具调用次数上限**:连续 80 轮返回 tool_use 也不会被截断(整项目改造是几十上百轮正常工作)
+- [x] 设了 `MAX_TOOL_ITERATIONS` 时仍按老行为在到达时中断并打印提示,session 完整可保存
+- [x] 每 `PROGRESS_EVERY_ITERATIONS` 轮打一行进度(轮数 + context + 怎么停),设 0 时不打
 - [x] 单批多个非 `finish` 工具 → 按顺序串行执行(用带副作用的假工具验证执行顺序,不是并发乱序)
 - [x] 模型文本输出通过 `onTextDelta` 增量打印,能观察到逐块输出而不是一次性蹦出整段
 - [x] 单条 tool_result 内容超过 `MAX_OUTPUT_CHARS` 时按首尾截断规则处理,不会把巨量内容原样灌进 messages
@@ -85,7 +87,7 @@
 - [x] 子 agent 内部的 `bash` 调用依然会触发确认(除非 `--full-auto`),不会绕过审批
 - [x] 子 agent 结束后,主 session 的 `messages` 只多一条 `spawn_agent` 的 `tool_result`,不包含子 agent 内部的中间消息
 - [x] 子 agent 执行过程在终端有可区分主/子的标记(比如前缀或缩进)
-- [x] 子 agent 撞到 `MAX_TOOL_ITERATIONS` 仍未 `finish` 时,能正常把"未完成"信息回传给主 agent,不会挂起主 loop
+- [x] 子 agent 撞到 `MAX_TOOL_ITERATIONS`(只在配了上限时可达)仍未 `finish` 时,能正常把"未完成"信息回传给主 agent,不会挂起主 loop
 
 ## 4. 目录范围限制(§6)
 

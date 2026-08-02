@@ -260,8 +260,8 @@ describe("scenario 5: user declines confirmation", () => {
   });
 });
 
-describe("scenario 6: MAX_TOOL_ITERATIONS exhausted", () => {
-  it("stops, warns, and leaves a complete saveable session", async () => {
+describe("scenario 6: MAX_TOOL_ITERATIONS as an opt-in ceiling (spec §3)", () => {
+  it("stops, warns, and leaves a complete saveable session when one is configured", async () => {
     const responses = Array.from({ length: 3 }, (_, i) =>
       toolResponse(use("read_file", `r${i}`, { path: "a.ts" })),
     );
@@ -280,9 +280,68 @@ describe("scenario 6: MAX_TOOL_ITERATIONS exhausted", () => {
 
     expect(result.outcome).toBe("max_iterations");
     expect(calls).toHaveLength(3);
-    expect(logged.some((line) => line.includes("3 tool iterations"))).toBe(true);
+    expect(logged.some((line) => line.includes("MAX_TOOL_ITERATIONS"))).toBe(true);
     expect(persisted).toHaveBeenCalledOnce();
     expect(danglingToolUseIds(s.messages)).toEqual([]);
+  });
+
+  it("runs past the old default of 50 rounds when no ceiling is set", async () => {
+    // Regression lock on the decision that replaced the hard cap: a
+    // whole-project migration is dozens of rounds of real work, and the
+    // cap severed one mid-flight, leaving a half-converted repo.
+    const responses = [
+      ...Array.from({ length: 80 }, (_, i) => toolResponse(use("read_file", `r${i}`, {}))),
+      toolResponse(use("finish", "f1", { summary: "done", status: "done" })),
+    ];
+    const { send, calls } = fakeSend(responses);
+    const s = session();
+
+    const result = await runTurn(s, "big migration", deps(send), {
+      tools: { read_file: fakeTool("read_file", () => "contents"), finish: finishStub },
+      log: () => {},
+      persist: noopPersist,
+    });
+
+    expect(result.outcome).toBe("finished");
+    expect(calls).toHaveLength(81);
+    expect(danglingToolUseIds(s.messages)).toEqual([]);
+  });
+
+  it("prints a progress line instead of severing the turn", async () => {
+    const responses = [
+      ...Array.from({ length: 7 }, (_, i) => toolResponse(use("read_file", `r${i}`, {}))),
+      textResponse("done"),
+    ];
+    const { send } = fakeSend(responses);
+    const logged: string[] = [];
+
+    await runTurn(session(), "long task", deps(send, {}, { progressEveryIterations: 3 }), {
+      tools: { read_file: fakeTool("read_file", () => "contents") },
+      log: (line) => logged.push(line),
+      persist: noopPersist,
+    });
+
+    const progress = logged.filter((line) => line.includes("still working"));
+    expect(progress).toHaveLength(2); // at rounds 3 and 6, not at round 0
+    expect(progress[0]).toMatch(/3 tool rounds/);
+    expect(progress[0]).toMatch(/Esc to stop/);
+  });
+
+  it("prints nothing extra when the progress line is disabled", async () => {
+    const responses = [
+      ...Array.from({ length: 7 }, (_, i) => toolResponse(use("read_file", `r${i}`, {}))),
+      textResponse("done"),
+    ];
+    const { send } = fakeSend(responses);
+    const logged: string[] = [];
+
+    await runTurn(session(), "long task", deps(send, {}, { progressEveryIterations: 0 }), {
+      tools: { read_file: fakeTool("read_file", () => "contents") },
+      log: (line) => logged.push(line),
+      persist: noopPersist,
+    });
+
+    expect(logged.some((line) => line.includes("still working"))).toBe(false);
   });
 });
 

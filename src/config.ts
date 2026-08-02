@@ -34,8 +34,14 @@ export function loadEnvFiles(root: string, home: string = os.homedir()): string[
 }
 
 export interface Config {
-  /** Safety net on tool-call rounds per turn (spec §3). */
+  /** Optional ceiling on tool-call rounds per turn; `0` means unlimited,
+   * which is the default (spec §3). Meant for unattended runs — an
+   * interactive user stops a turn with Esc. */
   maxToolIterations: number;
+  /** Print a progress line every N tool rounds; `0` disables it (spec §3).
+   * This is what replaced the old hard iteration cap: a long turn should be
+   * visible, not severed. */
+  progressEveryIterations: number;
   /** Default `bash` timeout in ms (spec §5.1). */
   commandTimeoutMs: number;
   /** Per-tool_result content cap; excess is head/tail truncated (spec §5.1). */
@@ -54,7 +60,8 @@ export interface Config {
 }
 
 export const DEFAULT_CONFIG: Config = {
-  maxToolIterations: 50,
+  maxToolIterations: 0,
+  progressEveryIterations: 25,
   commandTimeoutMs: 60_000,
   maxOutputChars: 30_000,
   compactThreshold: 0.75,
@@ -76,6 +83,15 @@ function positiveInt(raw: string | undefined, fallback: number): number {
   return Math.floor(parsed);
 }
 
+/** Same fallback rule, but `0` is a meaningful value ("no limit" /
+ * "disabled") rather than an invalid one. */
+function nonNegativeInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
 /** Same fallback rule as `positiveInt`, for a 0-1 ratio. */
 function fraction(raw: string | undefined, fallback: number): number {
   if (raw === undefined) return fallback;
@@ -86,7 +102,11 @@ function fraction(raw: string | undefined, fallback: number): number {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
-    maxToolIterations: positiveInt(env.MAX_TOOL_ITERATIONS, DEFAULT_CONFIG.maxToolIterations),
+    maxToolIterations: nonNegativeInt(env.MAX_TOOL_ITERATIONS, DEFAULT_CONFIG.maxToolIterations),
+    progressEveryIterations: nonNegativeInt(
+      env.PROGRESS_EVERY_ITERATIONS,
+      DEFAULT_CONFIG.progressEveryIterations,
+    ),
     commandTimeoutMs: positiveInt(env.COMMAND_TIMEOUT_MS, DEFAULT_CONFIG.commandTimeoutMs),
     maxOutputChars: positiveInt(env.MAX_OUTPUT_CHARS, DEFAULT_CONFIG.maxOutputChars),
     compactThreshold: fraction(env.COMPACT_THRESHOLD, DEFAULT_CONFIG.compactThreshold),

@@ -47,7 +47,7 @@ $ tcode --view [<id>]     # 在浏览器里查看某次会话的完整经过(见
 function runTurn(session, userInput):
     session.messages.push({ role: "user", content: userInput })
 
-    for i in 1..MAX_TOOL_ITERATIONS:       # 安全网,默认 50
+    loop forever:                          # 默认不设上限,见下方 MAX_TOOL_ITERATIONS
         response = llm.send(session.messages, TOOLS, SYSTEM_PROMPT, onTextDelta: print)
                                               # 文本是边生成边通过 onTextDelta 打印的(流式),不是等 response 完整了再打印;
                                               # response 仍然是 send() resolve 之后拿到的完整累积结果,下面的逻辑不用感知是不是流式
@@ -79,7 +79,12 @@ function runTurn(session, userInput):
 
 - **`finish` 是提示性的**,不是进程退出信号。模型调用 `finish(summary, status)` 表示"这轮任务我认为做完了",CLI 打印 summary 并结束当前 turn 的内部循环,但进程继续跑 REPL,等待用户下一条输入。
 - **消息历史必须闭合**:一次响应里可能同时出现 `finish` 和其他 tool_use(模型经常这么做,比如先读一下文件再收尾)。循环永远先把该批所有 tool_use 执行完、`tool_result` 全部回填,再判断要不要 break;不能因为看到 `finish` 就跳过其余工具的执行/结果回填,否则下次 `--continue` 会因为 assistant 消息里有未闭合的 tool_use 而直接报错。
-- 达到 `MAX_TOOL_ITERATIONS` 仍未结束,强制中断当前 turn 并提示用户(防止死循环烧 token)。
+- **turn 的工具调用次数默认不设上限。**
+  - 早期决策是"默认 50 次,到了强制中断,防止死循环烧 token"。**已推翻。** 实跑撞到的是这样一轮:让它把整个项目改成 TypeScript + React,50 次调用全是有效工作(读文件、写 `.tsx`、改 state),干到一半被闸刀砍掉,留下一个改了一半、两种写法混在一起的仓库——比"烧掉一些 token"糟糕得多。大改造需要几十上百次工具调用是常态,不是异常。
+  - 这条决策当初成立,是因为**那时候没有中断手段**,计数器是唯一的刹车。现在 `Esc` 能随时停(见 3.2)、steering 能中途改方向、context 到阈值会自动压缩,计数器不再是唯一的刹车,而它砍掉正常工作的代价一直都在。
+  - 计数器本来也拦不住真正的死循环:模型反复"改一次 → 测失败 → 改回去"这种,50 次照样跑满,只是把烧钱换成了半成品。
+- **`MAX_TOOL_ITERATIONS` 保留成可选上限**,默认不设(`0`/未设置 = 无限)。给无人值守的场景用:CI、脚本、`--full-auto` 跑批。设了就仍然按老行为在到达时中断并提示。
+- **代替计数器的是可见性**:每 `PROGRESS_EVERY_ITERATIONS`(默认 25)次工具调用打一行进度(已调用次数、累计 token、怎么停),让长跑「看得见」而不是「被砍断」。无人值守时这行进入日志,有人值守时它就是按 Esc 的依据。
 - 工具执行报错时,以 `is_error: true` 的 tool_result 形式喂回给模型,让它自己决定重试或改变策略,而不是让进程崩溃。
 - `bash` 默认需要用户确认才会执行(见 5.1);`needsConfirmation`/`confirm` 是独立的 policy 函数(`approval.ts`,见 7 节),不写死在循环里。`--full-auto` 启动参数可以让 `needsConfirmation` 恒为 false,跳过确认。
 - **流式是 v1 就要有的接口设计**,不是事后加的开关(见 8.1)。`llm.send()` 统一接受 `onTextDelta` 回调,不管 adapter 内部是不是真流式:真流式的 adapter(Anthropic 优先做)边收边调回调;还没做流式的 adapter 可以先整段收完一次性调用回调兜底——`agent.ts` 的调用方式不用因为某个 provider 还没支持流式而分叉。
@@ -442,7 +447,9 @@ DEEPSEEK_API_KEY=sk-xxxxx
 DEEPSEEK_MODEL=deepseek-chat         # 可选
 DEEPSEEK_BASE_URL=                   # 可选,默认 https://api.deepseek.com
 
-MAX_TOOL_ITERATIONS=50               # 可选,单轮 turn 内最大工具调用次数
+MAX_TOOL_ITERATIONS=                 # 可选,单轮 turn 内工具调用次数上限。默认不设(0/未设置 = 无限),
+                                     # 给 CI / 无人值守跑批用;交互使用靠 Esc 停(见 3.2)
+PROGRESS_EVERY_ITERATIONS=25         # 可选,每多少次工具调用打一行进度;0 = 不打
 COMMAND_TIMEOUT_MS=60000             # 可选,bash 工具超时
 MAX_OUTPUT_CHARS=30000               # 可选,单条 tool_result 内容上限(超出按首尾各留一半截断,见 5.1)
 
@@ -578,7 +585,7 @@ TRACE=on                             # 可选,设为 off 关闭事件追踪(见 
 3. **`finish` 与其他 tool_use 混在同一响应** → 全部执行、tool_result 全部回填、消息历史闭合;再模拟一次"追加新 user 消息"的 `--continue` 场景,断言不会因为悬空 tool_use 报错(这是第 3 节修过的那个 bug 的回归锁,必须有专门用例,不能只留在 spec 文字里)。
 4. 工具执行抛错 → `is_error: true` 回填,loop 不崩溃、继续调 LLM。
 5. 用户拒绝确认(mock `confirm` 返回 `false`)→ 回填拒绝结果、不执行、loop 继续。
-6. 连续 `MAX_TOOL_ITERATIONS` 次都返回 tool_use、不返回 `finish` → 强制中断并提示,session 仍完整可保存。
+6. 配了 `MAX_TOOL_ITERATIONS` 时,连续这么多次都返回 tool_use、不返回 `finish` → 中断并提示,session 仍完整可保存;**不配时不截断**,只按 `PROGRESS_EVERY_ITERATIONS` 打进度行。
 7. 单批多个非 `finish` 工具 → 按顺序串行执行(用一个带副作用的假工具断言执行顺序,而不是并发)。
 8. `spawn_agent` 执行时递归调用一次子 `runTurn`(用假 `llm.send()` 模拟子 agent 也调用了 `finish`)→ 断言主 session 只多了一条 `spawn_agent` 的 tool_result(内容是子 agent 的 summary),不包含子 agent 的中间消息;且传给子 `runTurn` 的工具集里不含 `spawn_agent`。
 
