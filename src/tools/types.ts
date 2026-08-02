@@ -6,6 +6,7 @@
  */
 import type { Config } from "../config.js";
 import type { ToolDefinition } from "../llm/types.js";
+import type { Tracer } from "../trace.js";
 
 export interface ToolContext {
   /** Project root; every path tool resolves against this (spec §6). */
@@ -13,6 +14,9 @@ export interface ToolContext {
   config: Config;
   /** Terminal output sink — subagents pass a prefixing logger (spec §5.6). */
   log: (line: string) => void;
+  /** Event log, so a tool that runs a nested agent can trace into it
+   * (spec §13). Tools that don't need it can ignore it. */
+  tracer: Tracer;
 }
 
 export interface Tool {

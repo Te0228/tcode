@@ -24,6 +24,7 @@ import {
 } from "./context.js";
 import { saveSession, type Session } from "./session.js";
 import { estimateTokens, formatTokens } from "./tokens.js";
+import { NOOP_TRACER, type Tracer } from "./trace.js";
 import { FINISH_TOOL_NAME, finishPayloadOf, type FinishPayload } from "./tools/finish.js";
 import { BASE_TOOLS, type ToolRegistry } from "./tools/index.js";
 import { truncateOutput } from "./tools/types.js";
@@ -51,6 +52,9 @@ export interface RunTurnOptions {
   /** Persistence hook; subagents pass a no-op so throwaway histories
    * don't litter `.tcode/sessions/` (spec §5.6). */
   persist?: (session: Session) => void;
+  /** Event log (spec §13). Subagents get `tracer.child()` so their steps
+   * land in the same file one level deeper. */
+  tracer?: Tracer;
 }
 
 export type TurnOutcome = "finished" | "no_tool_use" | "max_iterations";
@@ -109,6 +113,7 @@ async function compact(
   tokensBefore: number,
   deps: AgentDeps,
   status: (line: string) => void,
+  tracer: Tracer,
 ): Promise<boolean> {
   const transcript = renderForSummary(session.messages.slice(0, cutIndex));
   status(`⋯ compacting ${cutIndex} earlier messages to free context`);
@@ -131,8 +136,10 @@ async function compact(
       ...(session.compactions ?? []),
       { upToIndex: cutIndex, summary, tokensBefore, createdAt: new Date().toISOString() },
     ];
+    tracer.emit("compaction", { upToIndex: cutIndex, tokensBefore, ok: true, summary });
     return true;
   } catch (error) {
+    tracer.emit("compaction", { upToIndex: cutIndex, tokensBefore, ok: false, error: errorMessageOf(error) });
     status(`⚠ compaction failed (${errorMessageOf(error)}); continuing with omitted tool output`);
     return false;
   }
@@ -143,6 +150,7 @@ async function executeToolUse(
   tools: ToolRegistry,
   deps: AgentDeps,
   log: (line: string) => void,
+  tracer: Tracer,
 ): Promise<ToolResultBlock> {
   const tool = tools[toolUse.name];
   if (!tool) {
@@ -156,28 +164,36 @@ async function executeToolUse(
     };
   }
 
+  const startedAt = Date.now();
   try {
     const input = (toolUse.input ?? {}) as Record<string, unknown>;
     const output = await tool.execute(input, {
       root: deps.root,
       config: deps.config,
       log,
+      tracer,
     });
-    return {
-      type: "tool_result",
-      toolUseId: toolUse.id,
-      content: truncateOutput(output, deps.config.maxOutputChars),
-      isError: false,
-    };
+    const content = truncateOutput(output, deps.config.maxOutputChars);
+    tracer.emit("tool_result", {
+      id: toolUse.id,
+      name: toolUse.name,
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      content,
+    });
+    return { type: "tool_result", toolUseId: toolUse.id, content, isError: false };
   } catch (error) {
     // Tool failures are fed back to the model as is_error so it can retry
     // or change approach — they never crash the turn (spec §3).
-    return {
-      type: "tool_result",
-      toolUseId: toolUse.id,
-      content: truncateOutput(errorMessageOf(error), deps.config.maxOutputChars),
-      isError: true,
-    };
+    const content = truncateOutput(errorMessageOf(error), deps.config.maxOutputChars);
+    tracer.emit("tool_result", {
+      id: toolUse.id,
+      name: toolUse.name,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+      content,
+    });
+    return { type: "tool_result", toolUseId: toolUse.id, content, isError: true };
   }
 }
 
@@ -190,6 +206,8 @@ export async function runTurn(
   const tools = options.tools ?? BASE_TOOLS;
   const log = options.log ?? ((line: string) => console.log(line));
   const persist = options.persist ?? saveSession;
+  const tracer = options.tracer ?? NOOP_TRACER;
+  const turnStartedAt = Date.now();
 
   // Streamed text has no trailing newline of its own; remember whether we
   // left the cursor mid-line so status lines start cleanly.
@@ -209,6 +227,7 @@ export async function runTurn(
   };
 
   session.messages.push({ role: "user", content: [{ type: "text", text: userInput }] });
+  tracer.emit("turn_start", { input: userInput });
 
   const budget: Budget = computeBudget({
     contextWindowTokens: deps.contextWindowTokens,
@@ -236,17 +255,27 @@ export async function runTurn(
         view.tokens,
         deps,
         status,
+        tracer,
       );
       if (compacted) {
         view = buildSendView(session, budget);
         status(`⋯ context now ${formatTokens(view.tokens)}/${formatTokens(budget.contextWindowTokens)}`);
       }
     } else if (view.level === "omitted" && !announcedOmission) {
+      tracer.emit("context_omitted", { tokens: view.tokens, budget: budget.historyTokens });
       status("⋯ older tool output omitted from this request to stay within context");
       announcedOmission = true;
     }
 
     lastViewTokens = view.tokens;
+
+    tracer.emit("request_start", {
+      iteration,
+      viewLevel: view.level,
+      tokens: view.tokens,
+      messageCount: view.messages.length,
+    });
+    const requestStartedAt = Date.now();
 
     const response = await deps.send(
       view.messages,
@@ -264,6 +293,14 @@ export async function runTurn(
     if (text.trim()) lastText = text;
 
     const toolUses = toolUseBlocksOf(response);
+    tracer.emit("request_end", {
+      durationMs: Date.now() - requestStartedAt,
+      stopReason: response.stopReason,
+      textLength: text.length,
+      toolCount: toolUses.length,
+    });
+    if (text.trim()) tracer.emit("assistant_text", { text });
+
     if (toolUses.length === 0) {
       outcome = "no_tool_use";
       break;
@@ -274,20 +311,29 @@ export async function runTurn(
     const results: ToolResultBlock[] = [];
     for (const toolUse of toolUses) {
       status(summaryLineOf(toolUse));
+      tracer.emit("tool_call", { id: toolUse.id, name: toolUse.name, input: toolUse.input });
 
-      if (deps.approval.needsConfirmation(toolUse) && !(await deps.approval.confirm(toolUse))) {
-        // A decline is reported back as an error result, not silently
-        // skipped — otherwise the model can't tell it didn't run (spec §3).
-        results.push({
-          type: "tool_result",
-          toolUseId: toolUse.id,
-          content: "user declined to run this tool",
-          isError: true,
+      if (deps.approval.needsConfirmation(toolUse)) {
+        const approved = await deps.approval.confirm(toolUse);
+        tracer.emit("approval", {
+          id: toolUse.id,
+          name: toolUse.name,
+          decision: approved ? "approved" : "declined",
         });
-        continue;
+        if (!approved) {
+          // A decline is reported back as an error result, not silently
+          // skipped — otherwise the model can't tell it didn't run (spec §3).
+          results.push({
+            type: "tool_result",
+            toolUseId: toolUse.id,
+            content: "user declined to run this tool",
+            isError: true,
+          });
+          continue;
+        }
       }
 
-      results.push(await executeToolUse(toolUse, tools, deps, log));
+      results.push(await executeToolUse(toolUse, tools, deps, log, tracer));
     }
 
     // Close the history BEFORE deciding whether to break. A response can
@@ -316,10 +362,13 @@ export async function runTurn(
   // context management writes back is the compaction cache (spec §3.1).
   persist(session);
 
-  return {
+  const usage = { tokens: lastViewTokens, contextWindowTokens: budget.contextWindowTokens };
+  tracer.emit("turn_end", {
     outcome,
-    finish,
-    lastText,
-    usage: { tokens: lastViewTokens, contextWindowTokens: budget.contextWindowTokens },
-  };
+    durationMs: Date.now() - turnStartedAt,
+    usage,
+    ...(finish ? { finish } : {}),
+  });
+
+  return { outcome, finish, lastText, usage };
 }

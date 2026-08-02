@@ -76,6 +76,7 @@ export function createSpawnAgentTool(spawn: SpawnAgentDeps): Tool {
         throw new ToolError(`role must be "general" or "explore", got "${role}"`);
       }
 
+      context.tracer.emit("subagent_start", { role, task });
       context.log(`⇢ subagent [${role}] started`);
 
       // Fresh, empty history — the subagent shares nothing with the main
@@ -106,9 +107,18 @@ export function createSpawnAgentTool(spawn: SpawnAgentDeps): Tool {
         log: prefixed,
         writeText,
         persist: () => {},
+        // Same trace file, one level deeper: the subagent's steps are the
+        // most interesting thing to visualize, and they never enter the
+        // main session (spec §5.6/§13.1).
+        tracer: context.tracer.child(),
       });
 
       if (pending) prefixed(pending);
+      context.tracer.emit("subagent_end", {
+        role,
+        outcome: result.outcome,
+        summary: result.finish?.summary ?? result.lastText,
+      });
       context.log(`⇠ subagent [${role}] ${result.outcome}`);
 
       // Only the summary crosses back into the main session — that's the

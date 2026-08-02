@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config.js";
+import { NOOP_TRACER } from "../../src/trace.js";
 import { PathEscapesRootError } from "../../src/security.js";
 import { bashTool } from "../../src/tools/bash.js";
 import { finishTool } from "../../src/tools/finish.js";
@@ -15,7 +16,7 @@ let context: ToolContext;
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "tcode-tools-test-"));
-  context = { root, config: DEFAULT_CONFIG, log: () => {} };
+  context = { root, config: DEFAULT_CONFIG, log: () => {}, tracer: NOOP_TRACER };
 });
 
 afterEach(() => {

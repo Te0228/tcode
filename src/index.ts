@@ -22,11 +22,15 @@ import {
   type Session,
 } from "./session.js";
 import { createToolRegistry } from "./tools/spawn_agent.js";
+import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
+import { startViewer } from "./viewer/server.js";
 
 interface CliArgs {
   continueLatest: boolean;
   resumeId?: string;
   fullAuto: boolean;
+  /** `--view [id]`: open the read-only trace viewer (spec §13.4). */
+  view?: { sessionId?: string };
 }
 
 export function parseArgs(argv: string[]): CliArgs {
@@ -42,6 +46,11 @@ export function parseArgs(argv: string[]): CliArgs {
       args.resumeId = id;
     } else if (arg === "--full-auto") {
       args.fullAuto = true;
+    } else if (arg === "--view") {
+      // Optional positional id; a following flag is not consumed as one.
+      const next = argv[i + 1];
+      const sessionId = next && !next.startsWith("-") ? argv[++i] : undefined;
+      args.view = { sessionId };
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
@@ -66,6 +75,21 @@ function resolveSession(root: string, args: CliArgs, provider: string, model: st
   return createSession(root, provider, model);
 }
 
+/** `--view` path (spec §13.4): serve the trace and exit only on Ctrl+C.
+ * Deliberately does not resolve a provider — viewing needs no API key. */
+async function runViewer(root: string, sessionId?: string): Promise<void> {
+  const session = sessionId ? loadSession(root, sessionId) : findLatestSession(root);
+  if (!session) {
+    console.error(`tcode: no session found in ${path.join(root, ".tcode", "sessions")}`);
+    process.exit(1);
+  }
+
+  const url = await startViewer({ cwd: root, sessionId: session.id });
+  console.log(`tcode viewer · session ${session.id}`);
+  console.log(`${url}\n`);
+  console.log(`live-updates while tcode runs in this directory; Ctrl+C to stop`);
+}
+
 async function main(): Promise<void> {
   const root = path.resolve(process.cwd());
   loadEnvFiles(root);
@@ -78,6 +102,10 @@ async function main(): Promise<void> {
     // A missing API key for the active provider fails here, before the
     // REPL opens (spec §8.2). A bad --resume id fails here too, rather
     // than silently starting a fresh session (spec §4).
+    if (args.view) {
+      await runViewer(root, args.view.sessionId);
+      return;
+    }
     providerConfig = resolveProviderConfig();
     session = resolveSession(root, args, providerConfig.provider, providerConfig.model);
   } catch (error) {
@@ -162,6 +190,20 @@ async function main(): Promise<void> {
   };
   const tools = createToolRegistry(deps);
 
+  // Trace is the data source for `tcode --view` (spec §13). It appends to
+  // one file per session, so --continue keeps everything in one place.
+  const tracer = tracingEnabled()
+    ? createFileTracer({ cwd: root, sessionId: session.id })
+    : NOOP_TRACER;
+  tracer.emit("session_start", {
+    provider: providerConfig.provider,
+    model: providerConfig.model,
+    root,
+    fullAuto: args.fullAuto,
+    contextWindowTokens: providerConfig.contextWindowTokens,
+    sessionId: session.id,
+  });
+
   // Validate the budget once, at startup, before the user has typed
   // anything — a silently-zero budget looks like a dumb model (spec §3.1).
   const budgetInputs = {
@@ -191,7 +233,12 @@ async function main(): Promise<void> {
     if (!input || input === "exit" || input === "quit") break;
 
     try {
-      const result = await runTurn(session, input, deps, { tools, log, persist: saveSession });
+      const result = await runTurn(session, input, deps, {
+        tools,
+        log,
+        persist: saveSession,
+        tracer,
+      });
       if (result.finish) {
         const label = result.finish.status === "blocked" ? "⚠ blocked" : "✓ done";
         log(`\n${label}: ${result.finish.summary}`);
@@ -203,7 +250,9 @@ async function main(): Promise<void> {
     } catch (error) {
       // Keep the REPL alive on an API/network failure — the session is
       // still on disk and the user can retry.
-      console.error(`\nturn failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      const message = error instanceof Error ? error.message : String(error);
+      tracer.emit("error", { message });
+      console.error(`\nturn failed: ${message}\n`);
       saveSession(session);
     }
   }

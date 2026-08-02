@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config.js";
+import { NOOP_TRACER } from "../../src/trace.js";
 import { rememberTool } from "../../src/tools/remember.js";
 import { ROLE_TOOLS } from "../../src/tools/spawn_agent.js";
 import type { ToolContext } from "../../src/tools/types.js";
@@ -14,7 +15,7 @@ let context: ToolContext;
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "tcode-remember-test-"));
   logged = [];
-  context = { root, config: DEFAULT_CONFIG, log: (line) => logged.push(line) };
+  context = { root, config: DEFAULT_CONFIG, log: (line) => logged.push(line), tracer: NOOP_TRACER };
 });
 
 afterEach(() => {

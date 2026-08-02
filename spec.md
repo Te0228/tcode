@@ -22,6 +22,7 @@
 $ tcode
 $ tcode --continue        # 恢复 cwd 下最近一次会话
 $ tcode --resume <id>     # 恢复指定会话
+$ tcode --view [<id>]     # 在浏览器里查看某次会话的完整经过(见 13.4)
 ```
 
 实现方式:`package.json` 增加 `bin` 字段,把命令名注册为可执行入口:
@@ -273,6 +274,11 @@ src/
   memory.ts           # 分层记忆(见 9 节):加载 ~/.tcode/AGENTS.md + <project>/AGENTS.md|TCODE.md,
                       # 以及 remember 的追加写入
   tokens.ts           # estimateTokens(text) / estimateMessagesTokens(messages):启发式 token 估算(见 3.1)
+  trace.ts            # 事件追踪(见 13):追加写 .tcode/traces/<id>.jsonl。tracer.child() 给子 agent 加一层 depth。
+                      # 写失败只警告一次并降级成 no-op,绝不拖垮 turn
+  viewer/
+    server.ts         # tcode --view 的本地 http server + SSE(见 13.4)
+    page.ts           # 单文件 HTML,CSS/JS 内联,不引 CDN
   context.ts          # buildSendView(session, budget):完整历史 → 发送视图。三级降级 + compaction 切分点选择。
                       # 纯函数,不改 session、不发请求;真正调 LLM 生成摘要的那一步由 agent.ts 触发后写回 session.compactions
   prompt.ts           # buildSystemPrompt({ root, memory, fullAuto }):按 10 节要点拼 system prompt。
@@ -338,6 +344,7 @@ COMPACT_KEEP_RECENT=8                # 可选,compaction 时至少保留最近�
 RESERVED_OUTPUT_TOKENS=8192          # 可选,给模型输出预留的 token,不计入历史预算
 MEMORY_MAX_TOKENS=4000               # 可选,两层记忆合计上限(见 9.3/9.4)
 MIN_USABLE_HISTORY_TOKENS=2000       # 可选,历史预算低于此值时启动报警(见 3.1)
+TRACE=on                             # 可选,设为 off 关闭事件追踪(见 13.3)
 ```
 
 - 上面这些数值配置由 `config.ts` 在启动时解析一次(见 7 节),`agent.ts`/`tools/`/`context.ts` 一律从它取值,不各自读 `process.env`;非法值(非数字、<= 0)回退到默认值,不报错退出——数值配置写错不该拦住启动,和缺 API key 的处理级别不同。
@@ -505,3 +512,75 @@ tests/
 5. **手动触发一次 `spawn_agent`**:给主 agent 一个适合委派的任务(比如"在代码库里找出所有用到某个函数的地方"),确认子 agent 的完整过程只打印在终端、不进主 session 的历史,且主 session 里最终只留下一条 `spawn_agent` 的 tool_result。
 6. **跑一次 12.2 的端到端冒烟清单**,接真实模型,断言最终文件状态。
 7. **开始用 tcode 开发 tcode 自己**(dogfooding)——这是唯一能发现"模型这次表现是不是变差了"这类问题的方式,没有替代品,持续做,不是一次性步骤。
+
+## 13. 追踪与可视化
+
+### 13.1 为什么 trace 必须和 session 分开
+
+`session.messages` 存的是"发给模型的东西",不是"实际发生了什么"。两者差得很远:
+
+- 子 agent 的完整中间过程**故意不进 session**(见 5.6,这正是委派的目的)——但那恰恰是最值得看的思考过程。
+- 每轮耗时、token 用量、工具执行时长、审批批准还是拒绝、compaction 什么时候触发压缩了什么——session 里一个都没有。
+- session 会被 compaction 改写视图、会被裁剪(见 3.1);trace 要如实、要全、只追加不修改。
+
+所以是两个平行的产物,职责相反:
+
+```
+.tcode/sessions/<id>.json    发给模型的上下文真相 —— 要瘦,会被裁剪
+.tcode/traces/<id>.jsonl     实际发生了什么     —— 要全,只追加不修改
+```
+
+**先有 trace 才谈得上可视化。** 没有它,做任何 UI 都没有数据可显示。
+
+### 13.2 事件格式
+
+每行一个 JSON 对象(JSONL),公共字段:
+
+```jsonc
+{ "seq": 12, "t": 1754130000123, "depth": 0, "type": "tool_call", /* 各类型自己的字段 */ }
+```
+
+- `seq`——单调递增序号。时间戳精度不足以稳定排序,而 viewer 需要确定的顺序。
+- `t`——`Date.now()` 毫秒。
+- `depth`——嵌套层级。主 agent 是 0,子 agent 是 1。**子 agent 的事件写进同一个 trace 文件**,靠 `depth` 区分,这样 viewer 能画出嵌套结构,而不需要拼接多个文件。
+
+事件类型(v1):
+
+| type | 关键字段 |
+|---|---|
+| `session_start` | provider, model, root, fullAuto, contextWindowTokens |
+| `turn_start` | input |
+| `request_start` | iteration, viewLevel, tokens, messageCount |
+| `request_end` | durationMs, stopReason, textLength, toolCount |
+| `assistant_text` | text |
+| `tool_call` | id, name, input |
+| `approval` | id, name, decision("approved" \| "declined") |
+| `tool_result` | id, name, ok, durationMs, content |
+| `subagent_start` | role, task |
+| `subagent_end` | role, outcome, summary |
+| `context_omitted` | tokens, budget |
+| `compaction` | upToIndex, tokensBefore, tokensAfter, ok, error? |
+| `turn_end` | outcome, durationMs, usage, finish? |
+| `error` | message |
+
+- `tool_result` 的 `content` 复用 `MAX_OUTPUT_CHARS` 的截断规则——trace 要全,但不该因为一次 `cat` 大文件就写出几百 MB。
+- 写入失败(磁盘满、权限问题)**只打印一次警告然后静默降级**,绝不能让追踪失败拖垮用户的 turn。追踪是辅助功能,不是关键路径。
+
+### 13.3 开关与生命周期
+
+- 默认**开启**。JSONL 体积很小(工具输出已截断),而可观测性是这个功能存在的理由;默认关掉等于没做。
+- `TRACE=off` 关闭(见 8.2)。关闭时用一个 no-op tracer,调用点不需要判空。
+- trace 文件和 session 一一对应,`--continue`/`--resume` 时**追加**到同一个文件,不新建——一次会话的完整经过应该在一个文件里。
+
+### 13.4 Viewer
+
+```
+tcode --view              # 打开最近一次会话
+tcode --view <session-id> # 打开指定会话
+```
+
+- 起一个**本地 http server**(Node 内建 `http`,零新依赖),打印 URL 并尝试打开浏览器。
+- **不用 Electron**:数据已经在磁盘上,需要的是查看器不是应用。Electron 的价值在系统托盘、原生菜单、桌面分发,这个场景一个都不占,而渲染层它同样是 Chromium,画面上没有优势,却要背打包体积和构建链路。
+- 页面是单文件 HTML,CSS/JS 内联,不引 CDN——离线可用,也免得给一个本地工具引入供应链风险。
+- 实时更新:`/events` 走 SSE,tcode 跑着的时候页面自动追加新事件。
+- 只读。viewer 不提供任何修改会话/发起对话的能力,它就是个查看器。

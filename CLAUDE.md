@@ -9,6 +9,7 @@
 - **`doc/`** —— 解释性文档,**不是决策来源**。讲"为什么这么设计、模块之间怎么串",方便读代码时对照。和 spec.md 冲突时以 spec.md 为准,并且要回头修 `doc/`。
   - [doc/memory-design.md](doc/memory-design.md) —— 记忆的分层结构、`remember` 的安全设计(为什么没有 `path` 参数)、截断策略与时机
   - [doc/context-design.md](doc/context-design.md) —— 完整历史/发送视图分离、token 预算、三级降级、compaction 的触发时机与切分点约束
+  - [doc/trace-and-viewer.md](doc/trace-and-viewer.md) —— trace 为什么和 session 分开、事件格式、viewer 为什么不用 Electron
 
 **硬规则:代码里出现的行为,spec.md 必须先有对应决策。** 实现中如果发现 spec.md 没覆盖的情况(新的边界 case、和已有决策冲突的地方),先更新 spec.md 再写代码,不要边写边悄悄拍板——spec.md 和代码不同步是这个项目最容易出问题的地方。
 
@@ -53,6 +54,7 @@
 
 ```
 npm run dev      # tsx src/index.ts,开发模式跑 REPL
+tcode --view     # 在浏览器里查看某次会话的完整经过(含子 agent 内部过程)
 npm run build    # tsc 编译到 dist/
 npm test         # vitest run,单测 + loop 场景测试
 npm run test:watch
