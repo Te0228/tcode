@@ -12,6 +12,7 @@ import { createApprovalPolicy } from "./approval.js";
 import { loadConfig, loadEnvFiles, userConfigDir } from "./config.js";
 import { estimateTokens, formatTokens } from "./tokens.js";
 import { budgetWarning, buildSendView, computeBudget } from "./context.js";
+import { alignRight } from "./ui/chrome.js";
 import { createSend, MissingApiKeyError, resolveProviderConfig } from "./llm/index.js";
 import { loadMemory } from "./memory.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -38,7 +39,7 @@ import { isInterruptKey } from "./ui/keys.js";
 import { createLiveScreen, type InputRegion } from "./ui/live-screen.js";
 import { createEditor, type Key } from "./ui/editor.js";
 import { createSelect } from "./ui/select.js";
-import { banner, boxWidth, statusBar } from "./ui/chrome.js";
+import { GUTTER_WIDTH, header, rail, turnHeading } from "./ui/chrome.js";
 import { createSpinner, SPINNER_INTERVAL_MS, type Activity } from "./ui/spinner.js";
 import { colorEnabled, createPalette, type Palette } from "./ui/theme.js";
 import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
@@ -353,7 +354,24 @@ async function main(): Promise<void> {
   };
 
   const write = (text: string) => live.write(text);
-  const log = (line: string) => write(line.endsWith("\n") ? line : `${line}\n`);
+  /** Every line inside a turn hangs off the rail (spec §17.3), so nothing
+   * indents on its own and a turn reads as one block. */
+  const bodyRail = () => rail("body", palette, colored);
+  const log = (line: string) => write(`${bodyRail()}${line}\n`);
+  /** Outside a turn — headings and the blank lines between turns. */
+  const logBare = (line: string) => write(`${line}\n`);
+
+  let turnIndex = (session.messages ?? []).filter((message) =>
+    message.content.some((block) => block.type === "text" && message.role === "user"),
+  ).length;
+
+  const clock = () => {
+    const now = new Date();
+    return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  };
+
+  const heading = (role: "you" | "tcode", detail: string) =>
+    logBare(turnHeading({ index: turnIndex, role, detail }, layoutWidth(), palette, colored));
 
   // Assistant text, rendered a line at a time (spec §14.4 P3). Half a line
   // still streams out immediately — §3.2 wins on that — and is swapped for
@@ -376,8 +394,9 @@ async function main(): Promise<void> {
           breakAt = textBuffer.indexOf("\n");
         }
         // Pending always mirrors the buffer, so the two can never disagree
-        // about what is already on screen.
-        live.rewritePending(textBuffer);
+        // about what is already on screen — and it hangs off the rail like
+        // every other line inside a turn (spec §17.3).
+        live.rewritePending(textBuffer ? `${bodyRail()}${textBuffer}` : "");
       }
     : write;
 
@@ -403,13 +422,15 @@ async function main(): Promise<void> {
     if (awaitingMessage) {
       const resolve = awaitingMessage;
       awaitingMessage = null;
-      log(`${palette.accent("›")} ${palette.userInput(text)}`);
+      turnIndex += 1;
+      heading("you", clock());
+      for (const line of text.split("\n")) log(palette.userInput(line));
       resolve(text);
       return;
     }
     queued.push(text);
-    log(`${palette.accent("›")} ${palette.userInput(text)}`);
-    log(palette.meta(`  queued (${queued.length}) — joins this turn at the next step`));
+    for (const line of text.split("\n")) log(palette.userInput(line));
+    log(palette.meta(`queued (${queued.length}) — joins this turn at the next step`));
   };
 
   const readMessage = (): Promise<string | null> =>
@@ -437,7 +458,10 @@ async function main(): Promise<void> {
         deliver(action.text);
         break;
       case "interrupt":
-        onInterrupt();
+        onInterrupt(false);
+        break;
+      case "cancel":
+        onInterrupt(true);
         break;
       case "eof":
         quit();
@@ -589,18 +613,21 @@ async function main(): Promise<void> {
       process.exit(result.outcome === "finished" || result.outcome === "no_tool_use" ? 0 : 1);
   }
 
-  for (const line of banner(
-    {
-      model: `${providerConfig.provider}/${providerConfig.model}`,
-      root,
-      session: session.id,
-      fullAuto: args.fullAuto,
-    },
-    boxWidth(columns()),
-    palette,
-  )) {
-    console.log(line);
-  }
+  const layoutWidth = () => Math.min(100, Math.max(20, columns() - 1));
+  const colored = colorEnabled(colorOptions);
+  console.log(
+    header(
+      {
+        model: `${providerConfig.provider}/${providerConfig.model}`,
+        root,
+        session: session.id,
+        fullAuto: args.fullAuto,
+      },
+      layoutWidth(),
+      palette,
+      colored,
+    ),
+  );
   console.log("");
 
   // Starting fresh on top of existing history is the one case worth a nudge
@@ -624,28 +651,46 @@ async function main(): Promise<void> {
   // disappears is what made the old REPL read as unfinished (spec §16.2).
   live.start();
 
+  // The empty state is the one hint that belongs in the scrollback: a fresh
+  // session has no conversation above the input at all, so a blank wall
+  // gives the user no idea what this tool even is (spec §17.4). The phrase
+  // mirrors the status bar's `/help`, and hangs off the body rail so it
+  // reads as a suggestion to act rather than a stray line.
+  if (interactive && turnIndex === 0) {
+    log(palette.meta(`try \`fix the failing test\` — or type \`/help\` to see commands`));
+    logBare("");
+  }
+
   // Input typed while a turn is running is queued for the next one, and
   // Ctrl+C interrupts that turn rather than killing the process (spec §3.2).
   const queued: string[] = [];
   let controller: AbortController | null = null;
 
-  const onInterrupt = () => {
-    // Idempotent: readline (TTY) and the process handler (pipes) can both
-    // fire for one Ctrl+C, and `aborted` makes the second call a no-op.
+  /**
+   * Esc and Ctrl+C both stop a running turn. At the prompt they differ:
+   * Esc clears what is typed, Ctrl+C clears it and then — on a second
+   * press, with nothing left to lose — quits. Neither may throw away typed
+   * text and exit in the same keystroke.
+   */
+  const onInterrupt = (hard: boolean) => {
     if (controller && !controller.signal.aborted) {
       controller.abort();
-      log(palette.warn(`\n⎋ interrupted — stopping the running command (press again to quit)`));
+      log(palette.warn(`⎋ interrupted — stopping the running command`));
       return;
     }
-    log("");
-    quit();
+    if (editor.line.length > 0 || editor.draftLines.length > 0) {
+      editor.reset();
+      live.refresh();
+      return;
+    }
+    if (hard) quit();
   };
 
   // readline only emits SIGINT when stdin is a TTY. Without the process
   // handler, a piped stdin falls through to the default action — the
   // process dies mid-turn and the whole turn is lost, which is the exact
   // data loss this feature exists to prevent (spec §3.2).
-  process.on("SIGINT", onInterrupt);
+  process.on("SIGINT", () => onInterrupt(true));
 
   // Esc is the de-facto interrupt key for this class of tool (spec §3.2).
   // Ctrl+C stays as the fallback: some terminals swallow Esc, and Esc is
@@ -797,13 +842,16 @@ async function main(): Promise<void> {
 
     controller = new AbortController();
     turnRunning = true;
+    const startedAt = Date.now();
+    logBare("");
+    heading("tcode", clock());
     try {
       const result = await runTurn(session, expanded.text, deps, {
         tools,
         log,
         writeText,
         palette,
-        columns,
+        contentWidth: () => layoutWidth() - GUTTER_WIDTH,
         onActivity: setActivity,
         persist: saveSession,
         tracer,
@@ -813,17 +861,27 @@ async function main(): Promise<void> {
         // the loop above.
         drainInput: () => queued.splice(0),
       });
+      const elapsed = `${Math.max(1, Math.round((Date.now() - startedAt) / 1000))}s`;
       if (result.finish) {
         const blocked = result.finish.status === "blocked";
-        const label = blocked ? palette.warn("⚠ blocked") : palette.success("✓ done");
-        log(`\n${label}: ${result.finish.summary}`);
+        const mark = blocked ? palette.warn("⚠") : palette.success("✓");
+        log("");
+        log(
+          alignRight(
+            `${mark} ${result.finish.summary}`,
+            palette.meta(`${clock()} · ${elapsed}`),
+            layoutWidth() - GUTTER_WIDTH,
+          ),
+        );
+      } else if (result.outcome === "interrupted") {
+        log(palette.warn("⎋ interrupted"));
       }
       // What the user almost always does next is `git diff` or `git add`,
       // and reconstructing the list from the scrollback is busywork (§15.6).
       if (result.changedFiles.length > 0) {
         log(
           palette.meta(
-            `\n${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"} changed: ` +
+            `${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"} changed: ` +
               result.changedFiles.join(", "),
           ),
         );
@@ -831,7 +889,7 @@ async function main(): Promise<void> {
       // The status bar carries context usage permanently now (spec §16.2);
       // announcing it again every turn would be repeating what is on screen.
       contextTokens = result.usage.tokens;
-      log("");
+      logBare("");
     } catch (error) {
       // Keep the REPL alive on an API/network failure — the session is
       // still on disk and the user can retry.
@@ -839,7 +897,8 @@ async function main(): Promise<void> {
       tracer.emit("error", { message });
       // Through `log`, not console.error: the input line is still drawn,
       // and a raw write would land inside it.
-      log(palette.error(`\nturn failed: ${message}`) + "\n");
+      log(palette.error(`turn failed: ${message}`));
+      logBare("");
       saveSession(session);
     } finally {
       controller = null;
@@ -850,6 +909,16 @@ async function main(): Promise<void> {
 
   live.stop();
   if (interactive) saveHistory(root, editor.snapshotHistory(), HISTORY_MAX_ENTRIES);
+
+  // Owning stdin means owning its shutdown: a resumed raw-mode stdin with a
+  // `data` listener keeps the event loop alive forever, so the process
+  // would sit there after the REPL had already finished. `rl.close()` used
+  // to do this.
+  if (interactive) {
+    process.stdin.setRawMode(false);
+    process.stdin.pause();
+    process.stdin.removeAllListeners("data");
+  }
 }
 
 main().catch((error) => {

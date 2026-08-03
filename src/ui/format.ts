@@ -8,7 +8,7 @@
  * would otherwise catch.
  */
 import type { DisplayLine } from "../tools/types.js";
-import { alignRight } from "./chrome.js";
+import { alignRight, tintedRow } from "./chrome.js";
 import { detectLanguage, highlight, type Language } from "./highlight.js";
 import type { Palette } from "./theme.js";
 
@@ -24,14 +24,21 @@ export const DEFAULT_MAX_RESULT_LINES = 6;
  * colours (spec §16.8). */
 const DIFF_ROW = /^(\s*\d*\s[-+ ]\s)([\s\S]*)$/;
 
-function renderDisplayLine(line: DisplayLine, palette: Palette): string {
+function renderDisplayLine(line: DisplayLine, palette: Palette, width = 0): string {
   const style = toneStyle(palette, line.tone);
-  if (!line.code || line.code === "none") return style(line.text);
+  const split = line.code && line.code !== "none" ? DIFF_ROW.exec(line.text) : null;
+  const body = split
+    ? // The marker keeps its added/removed colour; the code gets the syntax.
+      `${style(split[1])}${highlight(split[2], line.code!, palette)}`
+    : style(line.code && line.code !== "none" ? highlight(line.text, line.code, palette) : line.text);
 
-  const split = DIFF_ROW.exec(line.text);
-  if (!split) return style(highlight(line.text, line.code, palette));
-  // The marker keeps its added/removed colour; the code gets the syntax.
-  return `${style(split[1])}${highlight(split[2], line.code, palette)}`;
+  // A full-row tint is what makes a diff read like an editor rather than a
+  // log (spec §17.1). It needs the row padded to width, so it only applies
+  // where the width is known and the palette actually tints.
+  if (!palette.tinted || width <= 0) return body;
+  if (line.tone === "added") return tintedRow(body, width, palette.addedRow);
+  if (line.tone === "removed") return tintedRow(body, width, palette.removedRow);
+  return body;
 }
 
 function toneStyle(palette: Palette, tone: DisplayLine["tone"]): (text: string) => string {
@@ -59,9 +66,13 @@ export function formatToolResult(
   lines: DisplayLine[],
   palette: Palette,
   maxLines = DEFAULT_MAX_RESULT_LINES,
+  width = 0,
 ): string[] {
   const shown = maxLines > 0 ? lines.slice(0, maxLines) : lines;
-  const rendered = shown.map((line) => `${RESULT_INDENT}${renderDisplayLine(line, palette)}`);
+  const inner = width > 0 ? width - RESULT_INDENT.length : 0;
+  const rendered = shown.map(
+    (line) => `${RESULT_INDENT}${renderDisplayLine(line, palette, inner)}`,
+  );
 
   const hidden = lines.length - shown.length;
   if (hidden > 0) {

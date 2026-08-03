@@ -168,10 +168,12 @@ describe("editor: completion (spec §15.4)", () => {
 });
 
 describe("editor: control keys (spec §3.2)", () => {
-  it("Esc interrupts and Ctrl+D on an empty line is EOF", () => {
+  it("separates Esc from Ctrl+C so neither discards text and quits at once", () => {
+    // Esc stops what is running or clears the line; Ctrl+C escalates to
+    // quitting, but only once there is nothing typed left to lose.
     const ed = editor();
     expect(ed.handleKey(undefined, key("escape"))).toEqual({ type: "interrupt" });
-    expect(ed.handleKey(undefined, key("c", { ctrl: true }))).toEqual({ type: "interrupt" });
+    expect(ed.handleKey(undefined, key("c", { ctrl: true }))).toEqual({ type: "cancel" });
     expect(ed.handleKey(undefined, key("d", { ctrl: true }))).toEqual({ type: "eof" });
   });
 
@@ -185,15 +187,17 @@ describe("editor: control keys (spec §3.2)", () => {
 });
 
 describe("editor: rendering (spec §16.2)", () => {
-  it("draws a box with the cursor inside it", () => {
+  it("draws a rail and a prompt, not a box (spec §17.1)", () => {
+    // A box here would collide with the modal dialogs, where a box means
+    // "deal with this now".
     const ed = editor();
     type(ed, "hi");
     const region = ed.render();
-    expect(region.lines).toHaveLength(3); // top, content, bottom
-    expect(region.lines[0].startsWith("╭")).toBe(true);
-    expect(region.cursorRow).toBe(1);
-    // border + space + prompt + "hi"
-    expect(region.cursorCol).toBe(1 + 1 + 2 + 2);
+    expect(region.lines).toHaveLength(1);
+    expect(region.lines[0]).toContain("›");
+    expect(region.cursorRow).toBe(0);
+    // rail (2) + prompt (2) + "hi"
+    expect(region.cursorCol).toBe(2 + 2 + 2);
   });
 
   it("places the cursor by display width, not character count", () => {
@@ -201,51 +205,34 @@ describe("editor: rendering (spec §16.2)", () => {
     // failure of taking over the input layer (spec §16.4).
     const ed = editor();
     type(ed, "中文");
-    expect(ed.render().cursorCol).toBe(1 + 1 + 2 + 4);
-  });
-
-  it("keeps every row the same width", () => {
-    const ed = editor({ columns: () => 60 });
-    type(ed, "abc");
-    const widths = new Set(ed.render().lines.map((line) => displayWidth(line)));
-    expect(widths.size).toBe(1);
-  });
-
-  it("drops the box in a window too narrow for it", () => {
-    const ed = editor({ columns: () => 20 });
-    type(ed, "hi");
-    const region = ed.render();
-    expect(region.lines).toEqual(["› hi"]);
-    expect(region.cursorRow).toBe(0);
+    expect(ed.render().cursorCol).toBe(2 + 2 + 4);
   });
 
   it("shows how many lines are already committed", () => {
     const ed = editor();
     ed.paste("a\nb\nc");
-    expect(ed.render().lines[1]).toContain("[+2 lines]");
+    expect(ed.render().lines[0]).toContain("[+2 lines]");
   });
 
   it("adds a status bar when one is supplied", () => {
     const ed = editor({ status: () => ({ left: "model · 1k/65k", hints: ["send"] }) });
     const lines = ed.render().lines;
-    expect(lines).toHaveLength(4);
-    expect(lines[3]).toContain("model · 1k/65k");
-    expect(lines[3]).toContain("send");
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toContain("model · 1k/65k");
+    expect(lines[1]).toContain("send");
   });
 });
 
 describe("editor: long input scrolls instead of overflowing (spec §16.2)", () => {
-  it("never renders a row wider than the box", () => {
-    // A row wider than its box wraps, silently becomes two screen rows, and
-    // every erase afterwards is one row short — the frame then leaves a
-    // trail of box borders behind it.
+  it("never renders a row wider than the layout", () => {
+    // A row wider than the layout wraps, silently becomes two screen rows,
+    // and every erase afterwards is one row short.
     const ed = editor({ columns: () => 60 });
     type(ed, "x".repeat(300));
-    const widths = new Set(ed.render().lines.map((line) => displayWidth(line)));
-    expect(widths).toEqual(new Set([59]));
+    for (const line of ed.render().lines) expect(displayWidth(line)).toBeLessThanOrEqual(59);
   });
 
-  it("keeps the cursor inside the box while typing past its width", () => {
+  it("keeps the cursor inside the layout while typing past its width", () => {
     const ed = editor({ columns: () => 60 });
     type(ed, "y".repeat(300));
     const region = ed.render();
@@ -256,21 +243,20 @@ describe("editor: long input scrolls instead of overflowing (spec §16.2)", () =
   it("shows the end of the line, which is where the cursor is", () => {
     const ed = editor({ columns: () => 60 });
     type(ed, `${"a".repeat(200)}TAIL`);
-    expect(ed.render().lines[1]).toContain("TAIL");
+    expect(ed.render().lines[0]).toContain("TAIL");
   });
 
   it("scrolls back when the cursor moves left", () => {
     const ed = editor({ columns: () => 60 });
     type(ed, `HEAD${"a".repeat(200)}`);
     for (let at = 0; at < 220; at++) ed.handleKey(undefined, key("left"));
-    expect(ed.render().lines[1]).toContain("HEAD");
+    expect(ed.render().lines[0]).toContain("HEAD");
   });
 
-  it("holds the box width with CJK text past the edge", () => {
+  it("holds the layout width with CJK text past the edge", () => {
     const ed = editor({ columns: () => 60 });
     type(ed, "中".repeat(100));
-    const widths = new Set(ed.render().lines.map((line) => displayWidth(line)));
-    expect(widths).toEqual(new Set([59]));
+    for (const line of ed.render().lines) expect(displayWidth(line)).toBeLessThanOrEqual(59);
   });
 
   it("stays inside a narrow window with no box either", () => {

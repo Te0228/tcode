@@ -18,8 +18,15 @@
  * can have is invisible except to a human staring at one.
  */
 import { displayWidth, sliceByWidth } from "./width.js";
-import { alignRight, box, boxFits, boxWidth, padTo } from "./chrome.js";
-import type { Palette } from "./theme.js";
+import {
+  GUTTER_WIDTH,
+  MAX_BOX_WIDTH,
+  alignRight,
+  padTo,
+  rail,
+  tintedRow,
+} from "./chrome.js";
+import { NO_COLOR_PALETTE, type Palette } from "./theme.js";
 
 export interface Key {
   name?: string;
@@ -33,8 +40,11 @@ export type EditorAction =
   | { type: "none" }
   /** A complete message; `text` already includes any continuation lines. */
   | { type: "submit"; text: string }
-  /** Esc, or Ctrl+C while something is running. */
+  /** Esc — stop what is running; at the prompt, clear the line. */
   | { type: "interrupt" }
+  /** Ctrl+C — stop, then clear, then quit. Never quits in one press while
+   * there is something typed that would be lost. */
+  | { type: "cancel" }
   /** Ctrl+D on an empty buffer, or Ctrl+C twice. */
   | { type: "eof" }
   /** Tab produced several candidates; the caller prints them. */
@@ -206,7 +216,7 @@ export function createEditor(options: EditorOptions) {
       if (key.ctrl) {
         switch (name) {
           case "c":
-            return { type: "interrupt" };
+            return { type: "cancel" };
           case "d":
             return buffer.length === 0 && draft.length === 0
               ? { type: "eof" }
@@ -319,52 +329,41 @@ export function createEditor(options: EditorOptions) {
     render(): RenderedInput {
       clampCursor();
       const columns = options.columns();
+      const width = Math.min(MAX_BOX_WIDTH, Math.max(20, columns - 1));
       const status = options.status?.();
-      const prompt = `${palette.accent("›")} `;
-      const promptWidth = 2;
+      const colored = palette !== NO_COLOR_PALETTE;
 
-      if (!boxFits(columns)) {
-        // A box in a narrow window costs more columns than it earns, so
-        // drop to a bare prompt rather than squeezing the content out.
-        const available = Math.max(1, columns - promptWidth - 1);
-        const typed = displayWidth(buffer.slice(0, cursor));
-        const scroll = Math.max(0, typed - available + 1);
-        return {
-          lines: [`${prompt}${sliceByWidth(buffer, scroll, available)}`],
-          cursorRow: 0,
-          cursorCol: promptWidth + typed - scroll,
-        };
-      }
-
-      const width = boxWidth(columns);
-      const inner = width - 2;
+      // A rail, not a box (spec §17.1): a box would collide with the modal
+      // dialogs, where a box means "deal with this now". The rail says
+      // instead that this belongs to the same conversation above it.
       const marker =
         draft.length > 0
           ? palette.meta(`[+${draft.length} line${draft.length === 1 ? "" : "s"}] `)
           : "";
       const markerWidth = displayWidth(marker);
+      const prefix = `${rail("head", palette, colored)}${palette.accent("›")} `;
+      const before = GUTTER_WIDTH + 2 + markerWidth;
 
-      // Horizontal scrolling, like any single-line input: the buffer can be
-      // longer than the box, and a row wider than its box wraps and breaks
-      // the frame arithmetic (spec §16.2).
-      const before = 1 + 1 + markerWidth + promptWidth;
-      const available = Math.max(1, inner - before + 1);
+      const available = Math.max(1, width - before);
       const typed = displayWidth(buffer.slice(0, cursor));
       const scroll = Math.max(0, typed - available + 1);
       const visible = sliceByWidth(buffer, scroll, available);
 
-      const content = ` ${marker}${prompt}${visible}`;
-      const lines = box([content], width, palette);
+      const lines = [`${prefix}${marker}${visible}`];
       if (status) {
-        lines.push(palette.meta(alignRight(`  ${status.left}`, `${status.hints.join(" · ")}  `, width)));
+        lines.push(
+          tintedRow(
+            alignRight(`  ${status.left}`, `${status.hints.join("  ")}  `, width),
+            width,
+            palette.statusRow,
+          ),
+        );
       }
 
-      // Row 1 is the box's first content row; the column offset is the
-      // border, the leading space, the draft marker and the prompt.
       return {
         lines,
-        cursorRow: 1,
-        cursorCol: Math.min(before + typed - scroll, inner),
+        cursorRow: 0,
+        cursorCol: before + typed - scroll,
       };
     },
 

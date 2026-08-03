@@ -149,3 +149,57 @@ const STYLE = /\u001b\[[0-9;]*m/g;
 function stripStyles(text: string): string {
   return text.replace(STYLE, "");
 }
+
+/** Two columns, everywhere: the rail plus one space. Indentation is the
+ * rail's job, so nothing inside a turn indents on its own (spec §17.3). */
+export const GUTTER_WIDTH = 2;
+
+/** Solid for a heading, thin for the body it owns. Without colour they
+ * degrade to ASCII — the structure must not depend on the palette. */
+export function rail(kind: "head" | "body", palette: Palette, colored: boolean): string {
+  if (!colored) return kind === "head" ? "| " : "| ";
+  return kind === "head" ? `${palette.accent("▌")} ` : `${palette.faint("│")} `;
+}
+
+export interface TurnHeadingInfo {
+  index: number;
+  role: "you" | "tcode";
+  /** Right-hand side: a clock time, an elapsed count, `interrupted`. */
+  detail: string;
+}
+
+/**
+ * The line that starts a turn (spec §17.2). The number answers "where am
+ * I", the detail answers "when, and how long" — neither was visible at all
+ * before, so a long session was an undifferentiated wall.
+ */
+export function turnHeading(
+  info: TurnHeadingInfo,
+  width: number,
+  palette: Palette,
+  colored: boolean,
+): string {
+  const label = `${info.index} · ${info.role}`;
+  const left = `${rail("head", palette, colored)}${palette.accent(label)}`;
+  return alignRight(left, palette.meta(info.detail), width);
+}
+
+/** One line, not a box: everything it says the status bar says too, and
+ * four rows of banner for that is a poor trade (spec §17.3). */
+export function header(info: BannerInfo, width: number, palette: Palette, colored: boolean): string {
+  const left =
+    `${rail("head", palette, colored)}${palette.accent("tcode")}  ` +
+    palette.meta(`${info.model}${info.fullAuto ? " · full-auto" : ""}`);
+  return alignRight(left, palette.meta(shortenPath(info.root)), width);
+}
+
+/** A row filled edge to edge with a tint. Padded *and* cut to width: a
+ * tinted row that wraps paints its background across two rows and the whole
+ * block shifts (spec §17.5). */
+export function tintedRow(
+  content: string,
+  width: number,
+  tint: (text: string) => string,
+): string {
+  return tint(padTo(content, width));
+}

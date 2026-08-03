@@ -28,10 +28,7 @@ import { estimateTokens, formatTokens } from "./tokens.js";
 import { NOOP_TRACER, type Tracer } from "./trace.js";
 import { FINISH_TOOL_NAME, finishPayloadOf, type FinishPayload } from "./tools/finish.js";
 import { BASE_TOOLS, type ToolRegistry } from "./tools/index.js";
-import { normalizeToolReturn, truncateOutput } from "./tools/types.js";
-import { formatToolCall, formatToolResult, outputLines } from "./ui/format.js";
-import { boxWidth } from "./ui/chrome.js";
-import { NO_COLOR_PALETTE, type Palette } from "./ui/theme.js";
+import { normalizeToolReturn, truncateOutput, type DisplayLine } from "./tools/types.js";
 import type { Activity } from "./ui/spinner.js";
 
 export interface AgentDeps {
@@ -45,15 +42,39 @@ export interface AgentDeps {
   contextWindowTokens: number;
 }
 
+/**
+ * What happened, never how to draw it (spec §17.6).
+ *
+ * The loop used to build finished strings — colours, widths, indentation —
+ * and hand them to the REPL to print. Every new layout rule then had to be
+ * threaded back through here, and one path always got missed. Now the loop
+ * reports and the REPL renders, so the rail, the gutter width and the turn
+ * grouping exist in exactly one place.
+ */
+export type TurnEvent =
+  /** A fragment of assistant text, as it streams. Not line-aligned. */
+  | { type: "text"; chunk: string }
+  /** A tool that prints while it runs, announced before it starts. */
+  | { type: "tool_start"; toolUse: ToolUseBlock }
+  | {
+      type: "tool_end";
+      toolUse: ToolUseBlock;
+      /** Short outcome for the right-hand column: `128 lines`, `+3 -1`. */
+      meta: string;
+      display: DisplayLine[];
+      failed: boolean;
+    }
+  /** Something the user should know that is not the model talking. */
+  | { type: "notice"; level: "info" | "warn" | "error"; text: string }
+  /** A message the user sent mid-turn, folded in (spec §3.2). */
+  | { type: "steering"; message: string };
+
 export interface RunTurnOptions {
   /** Overrides the default tool set — this is how `spawn_agent` hands a
    * subagent a trimmed registry without `spawn_agent` in it (spec §5.6). */
   tools?: ToolRegistry;
-  /** One-line status sink; subagents pass a prefixing logger (spec §5.6). */
-  log?: (line: string) => void;
-  /** Raw sink for streamed assistant text — deltas are fragments, not
-   * lines, so they must not go through `log` (spec §3/§8.1). */
-  writeText?: (chunk: string) => void;
+  /** Everything the turn produces, for the REPL to render (spec §17.6). */
+  onEvent?: (event: TurnEvent) => void;
   /** Persistence hook; subagents pass a no-op so throwaway histories
    * don't litter `.tcode/sessions/` (spec §5.6). */
   persist?: (session: Session) => void;
@@ -66,11 +87,6 @@ export interface RunTurnOptions {
   /** What the agent is doing right now, for the spinner (spec §14.4 P2).
    * The REPL owns the timer; the loop only reports transitions. */
   onActivity?: (activity: Activity | null) => void;
-  /** Terminal width, for the right-aligned outcome column (spec §16.9). */
-  columns?: () => number;
-  /** Semantic colours (spec §14). Defaults to no colour, so a caller that
-   * has not decided — tests, subagents — never emits escape sequences. */
-  palette?: Palette;
   /** Steering (spec §3.2): hands over anything the user typed while this
    * turn was running, to be folded into it rather than held for the next
    * one. Called once per iteration, at the only point where the history is
@@ -219,7 +235,7 @@ async function executeToolUse(
     // Two separate paths on purpose (spec §14.4 P0): the model gets the
     // full result, the user gets a summary capped at a few lines. Neither
     // truncation touches the other.
-    for (const line of formatToolResult(outcome.display ?? [], palette)) log(line);
+    for (const line of formatToolResult(outcome.display ?? [], palette, undefined, width)) log(line);
 
     tracer.emit("tool_result", {
       id: toolUse.id,
@@ -292,7 +308,7 @@ export async function runTurn(
   const activity = options.onActivity ?? (() => {});
   // Fixed for the turn: re-measuring per line would make the right-aligned
   // column jump if the window is resized mid-turn.
-  const width = boxWidth(options.columns?.() ?? 80);
+  const width = options.contentWidth?.() ?? 76;
   const turnStartedAt = Date.now();
 
   // Streamed text has no trailing newline of its own; remember whether we
@@ -452,7 +468,7 @@ export async function runTurn(
         if (typeof target === "string") changedFiles.add(target);
       }
       results.push(
-        await executeToolUse(toolUse, tools, deps, log, tracer, options.signal, palette, width),
+        await executeToolUse(toolUse, tools, deps, status, tracer, options.signal, palette, width),
       );
     }
 
