@@ -30,6 +30,9 @@ export interface ToolContext {
 export interface DisplayLine {
   text: string;
   tone?: "plain" | "added" | "removed" | "error" | "muted";
+  /** Language for syntax highlighting (spec §16.8). Absent or "none"
+   * leaves the line as written — guessing wrong is worse than plain. */
+  code?: "c-like" | "hash" | "lisp" | "sql" | "none";
 }
 
 /**
@@ -52,12 +55,19 @@ export interface ToolOutcome {
   /** The tool completed but the thing it ran failed (a non-zero exit).
    * Not the same as throwing, which is the tool itself failing. */
   failed?: boolean;
+  /** Right-aligned outcome on the tool's call line: `128 lines`, `+3 -1`,
+   * `exit 1` (spec §16.9). */
+  meta?: string;
 }
 
 export type ToolReturn = string | ToolOutcome;
 
 export interface Tool {
   schema: ToolDefinition;
+  /** True when the tool prints while it runs (`spawn_agent` streams a
+   * subagent's progress). Its call line has to be printed *before*
+   * execution, or that output lands above its own heading (spec §16.9). */
+  streamsOutput?: boolean;
   execute(
     input: Record<string, unknown>,
     context: ToolContext,

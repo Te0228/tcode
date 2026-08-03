@@ -803,6 +803,7 @@ async function main(): Promise<void> {
         log,
         writeText,
         palette,
+        columns,
         onActivity: setActivity,
         persist: saveSession,
         tracer,

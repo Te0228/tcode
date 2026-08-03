@@ -6,7 +6,7 @@
  * is the only practical way to catch an off-by-one in a box that is drawn
  * by arithmetic on display widths.
  */
-import { displayWidth } from "./width.js";
+import { displayWidth, sliceByWidth } from "./width.js";
 import type { Palette } from "./theme.js";
 
 /** Rounded, because square corners read as an older generation of terminal
@@ -38,11 +38,20 @@ export function boxFits(columns: number): boolean {
   return usable - 1 >= MIN_BOX_WIDTH;
 }
 
-/** Pads to `width` display columns — never `String.padEnd`, which counts
- * characters and so breaks on the first CJK character. */
+/**
+ * Exactly `width` display columns: padded if short, cut if long.
+ *
+ * The cut is not cosmetic. A box row wider than its box wraps, becomes two
+ * screen rows, and every erase afterwards is one row short — which is how
+ * a long line of input left a trail of box borders behind it. Never
+ * `String.padEnd`: it counts characters, so it loses a column per CJK
+ * character and the right border walks left.
+ */
 export function padTo(text: string, width: number): string {
-  const gap = width - displayWidth(text);
-  return gap > 0 ? text + " ".repeat(gap) : text;
+  const actual = displayWidth(text);
+  if (actual === width) return text;
+  if (actual < width) return text + " ".repeat(width - actual);
+  return fitToWidth(text, width);
 }
 
 /**
@@ -120,4 +129,23 @@ export function statusBar(
   const left = `${info.model} · ${formatTokens(info.tokens)}/${formatTokens(info.contextWindowTokens)}`;
   const right = info.hints.join(" · ");
   return palette.meta(alignRight(`  ${left}`, `${right}  `, width));
+}
+
+/**
+ * Cuts to `width` display columns, keeping the styling that was already
+ * applied. Styles carry no width, so they are re-emitted around the visible
+ * slice rather than counted.
+ */
+export function fitToWidth(text: string, width: number): string {
+  const plain = stripStyles(text);
+  if (displayWidth(plain) <= width) return text;
+  // A styled string cannot be cut mid-escape, so cut the plain text and
+  // accept losing the styling on an over-long row — those are rare and the
+  // alternative is a corrupted frame.
+  return sliceByWidth(plain, 0, width);
+}
+
+const STYLE = /\u001b\[[0-9;]*m/g;
+function stripStyles(text: string): string {
+  return text.replace(STYLE, "");
 }

@@ -8,6 +8,8 @@
  * would otherwise catch.
  */
 import type { DisplayLine } from "../tools/types.js";
+import { alignRight } from "./chrome.js";
+import { detectLanguage, highlight, type Language } from "./highlight.js";
 import type { Palette } from "./theme.js";
 
 /** Indent under a tool call, so results read as belonging to it. */
@@ -16,6 +18,21 @@ export const RESULT_INDENT = "  ";
 /** Default cap on result lines shown per tool call (spec §14.4 P0). The
  * model still receives everything. */
 export const DEFAULT_MAX_RESULT_LINES = 6;
+
+/** Splits a diff row into its gutter (line number and marker) and the code,
+ * so the code can be highlighted without the gutter picking up keyword
+ * colours (spec §16.8). */
+const DIFF_ROW = /^(\s*\d*\s[-+ ]\s)([\s\S]*)$/;
+
+function renderDisplayLine(line: DisplayLine, palette: Palette): string {
+  const style = toneStyle(palette, line.tone);
+  if (!line.code || line.code === "none") return style(line.text);
+
+  const split = DIFF_ROW.exec(line.text);
+  if (!split) return style(highlight(line.text, line.code, palette));
+  // The marker keeps its added/removed colour; the code gets the syntax.
+  return `${style(split[1])}${highlight(split[2], line.code, palette)}`;
+}
 
 function toneStyle(palette: Palette, tone: DisplayLine["tone"]): (text: string) => string {
   switch (tone) {
@@ -44,7 +61,7 @@ export function formatToolResult(
   maxLines = DEFAULT_MAX_RESULT_LINES,
 ): string[] {
   const shown = maxLines > 0 ? lines.slice(0, maxLines) : lines;
-  const rendered = shown.map((line) => `${RESULT_INDENT}${toneStyle(palette, line.tone)(line.text)}`);
+  const rendered = shown.map((line) => `${RESULT_INDENT}${renderDisplayLine(line, palette)}`);
 
   const hidden = lines.length - shown.length;
   if (hidden > 0) {
@@ -58,11 +75,19 @@ export function formatToolResult(
  * path after it is the content, and tinting content is how a palette turns
  * into decoration (spec §14.3).
  */
-export function formatToolCall(summary: string, palette: Palette): string {
+export function formatToolCall(summary: string, palette: Palette, meta = "", width = 0): string {
   const split = summary.indexOf(" ");
-  if (split <= 0) return palette.toolCall(summary);
-  return `${palette.toolCall(summary.slice(0, split))}${summary.slice(split)}`;
+  const left =
+    split <= 0
+      ? palette.toolCall(summary)
+      : `${palette.toolCall(summary.slice(0, split))}${summary.slice(split)}`;
+  if (!meta || width <= 0) return left;
+  // Action on the left, outcome on the right, so a column of results can be
+  // scanned without reading each line to its end (spec §16.9).
+  return alignRight(left, palette.meta(meta), width);
 }
+
+export { detectLanguage };
 
 /** Splits captured output into display lines, dropping the trailing blank
  * that every command's final newline produces. */
@@ -80,7 +105,12 @@ export function outputLines(text: string, tone: DisplayLine["tone"] = "plain"): 
  * finds it in O(n) with no memory blowup on a large file. An LCS would
  * only differ on interleaved changes, which `edit_file` cannot create.
  */
-export function diffLines(before: string, after: string, context = 2): DisplayLine[] {
+export function diffLines(
+  before: string,
+  after: string,
+  context = 2,
+  language: Language = "none",
+): DisplayLine[] {
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
 
@@ -106,21 +136,36 @@ export function diffLines(before: string, after: string, context = 2): DisplayLi
   const added = afterLines.slice(start, afterLines.length - end);
   if (removed.length === 0 && added.length === 0) return [];
 
+  // Widest line number decides the gutter, so the markers line up whether
+  // the change is at line 7 or line 1200.
+  const lastNumber = Math.max(beforeLines.length, afterLines.length);
+  const gutter = String(lastNumber).length;
+  const number = (value: number | null) =>
+    (value === null ? "" : String(value)).padStart(gutter);
+
   const lines: DisplayLine[] = [];
-  const contextBefore = beforeLines.slice(Math.max(0, start - context), start);
-  for (const text of contextBefore) lines.push({ text: `  ${text}`, tone: "muted" });
-  for (const text of removed) lines.push({ text: `- ${text}`, tone: "removed" });
-  for (const text of added) lines.push({ text: `+ ${text}`, tone: "added" });
-  const contextAfter = beforeLines.slice(
-    beforeLines.length - end,
-    beforeLines.length - end + context,
-  );
-  for (const text of contextAfter) lines.push({ text: `  ${text}`, tone: "muted" });
+  const push = (at: number | null, marker: string, text: string, tone: DisplayLine["tone"]) => {
+    lines.push({ text: `${number(at)} ${marker} ${text}`, tone, code: language });
+  };
+
+  const contextStart = Math.max(0, start - context);
+  beforeLines.slice(contextStart, start).forEach((text, offset) => {
+    push(contextStart + offset + 1, " ", text, "muted");
+  });
+  removed.forEach((text, offset) => push(start + offset + 1, "-", text, "removed"));
+  added.forEach((text, offset) => push(start + offset + 1, "+", text, "added"));
+  const tailStart = beforeLines.length - end;
+  beforeLines.slice(tailStart, tailStart + context).forEach((text, offset) => {
+    // A file ending in a newline splits to a final empty element; showing
+    // it as a context line renders a bare line number with nothing on it.
+    const isFinalBlank = text === "" && tailStart + offset === beforeLines.length - 1;
+    if (!isFinalBlank) push(tailStart + offset + 1, " ", text, "muted");
+  });
 
   return lines;
 }
 
-/** `+3 −1` style counts, for the tool_result the model reads. */
+/** `+3 -1` style counts, for the tool_result the model reads. */
 export function diffStat(before: string, after: string): string {
   const lines = diffLines(before, after, 0);
   const added = lines.filter((line) => line.tone === "added").length;

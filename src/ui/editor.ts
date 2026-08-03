@@ -17,7 +17,7 @@
  * testable without a terminal, which matters because every bug this file
  * can have is invisible except to a human staring at one.
  */
-import { displayPos, displayWidth } from "./width.js";
+import { displayWidth, sliceByWidth } from "./width.js";
 import { alignRight, box, boxFits, boxWidth, padTo } from "./chrome.js";
 import type { Palette } from "./theme.js";
 
@@ -326,9 +326,14 @@ export function createEditor(options: EditorOptions) {
       if (!boxFits(columns)) {
         // A box in a narrow window costs more columns than it earns, so
         // drop to a bare prompt rather than squeezing the content out.
-        const lines = [`${prompt}${buffer}`];
-        const at = displayPos(buffer.slice(0, cursor), columns);
-        return { lines, cursorRow: at.rows, cursorCol: promptWidth + at.cols };
+        const available = Math.max(1, columns - promptWidth - 1);
+        const typed = displayWidth(buffer.slice(0, cursor));
+        const scroll = Math.max(0, typed - available + 1);
+        return {
+          lines: [`${prompt}${sliceByWidth(buffer, scroll, available)}`],
+          cursorRow: 0,
+          cursorCol: promptWidth + typed - scroll,
+        };
       }
 
       const width = boxWidth(columns);
@@ -339,7 +344,16 @@ export function createEditor(options: EditorOptions) {
           : "";
       const markerWidth = displayWidth(marker);
 
-      const content = ` ${marker}${prompt}${buffer}`;
+      // Horizontal scrolling, like any single-line input: the buffer can be
+      // longer than the box, and a row wider than its box wraps and breaks
+      // the frame arithmetic (spec §16.2).
+      const before = 1 + 1 + markerWidth + promptWidth;
+      const available = Math.max(1, inner - before + 1);
+      const typed = displayWidth(buffer.slice(0, cursor));
+      const scroll = Math.max(0, typed - available + 1);
+      const visible = sliceByWidth(buffer, scroll, available);
+
+      const content = ` ${marker}${prompt}${visible}`;
       const lines = box([content], width, palette);
       if (status) {
         lines.push(palette.meta(alignRight(`  ${status.left}`, `${status.hints.join(" · ")}  `, width)));
@@ -347,12 +361,10 @@ export function createEditor(options: EditorOptions) {
 
       // Row 1 is the box's first content row; the column offset is the
       // border, the leading space, the draft marker and the prompt.
-      const before = 1 + 1 + markerWidth + promptWidth;
-      const typed = displayWidth(buffer.slice(0, cursor));
       return {
         lines,
         cursorRow: 1,
-        cursorCol: Math.min(before + typed, inner),
+        cursorCol: Math.min(before + typed - scroll, inner),
       };
     },
 

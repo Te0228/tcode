@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveInRoot } from "../security.js";
-import { diffLines, diffStat } from "../ui/format.js";
+import { detectLanguage, diffLines, diffStat } from "../ui/format.js";
 import { requireString, type Tool } from "./types.js";
 
 export const writeFileTool: Tool = {
@@ -33,7 +33,8 @@ export const writeFileTool: Tool = {
     const verb = existed ? "overwrote" : "created";
     return {
       result: `${verb} ${inputPath} (${content.length} chars) ${diffStat(before, content)}`,
-      display: diffLines(before, content),
+      display: diffLines(before, content, 2, detectLanguage(inputPath)),
+      meta: diffStat(before, content),
     };
   },
 };

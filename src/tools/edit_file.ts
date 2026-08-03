@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveInRoot } from "../security.js";
-import { diffLines, diffStat } from "../ui/format.js";
+import { detectLanguage, diffLines, diffStat } from "../ui/format.js";
 import { ToolError, requireString, type Tool } from "./types.js";
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -54,7 +54,8 @@ export const editFileTool: Tool = {
       fs.writeFileSync(resolved, newString);
       return {
         result: `created ${inputPath} (${newString.length} chars)`,
-        display: diffLines("", newString),
+        display: diffLines("", newString, 2, detectLanguage(inputPath)),
+        meta: diffStat("", newString),
       };
     }
 
@@ -87,7 +88,8 @@ export const editFileTool: Tool = {
     const suffix = matches > 1 ? ` (${matches} occurrences replaced)` : "";
     return {
       result: `edited ${inputPath}${suffix} ${diffStat(content, updated)}`,
-      display: diffLines(content, updated),
+      display: diffLines(content, updated, 2, detectLanguage(inputPath)),
+      meta: diffStat(content, updated),
     };
   },
 };

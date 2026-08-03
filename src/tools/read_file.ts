@@ -71,13 +71,9 @@ export const readFileTool: Tool = {
     // echoed back at them (spec §14.4 P0).
     return {
       result: truncateOutput(truncated, context.config.maxOutputChars),
-      display: [
-        {
-          text: `${selected.length} line${selected.length === 1 ? "" : "s"}` +
-            (selected.length < allLines.length ? ` of ${allLines.length}` : ""),
-          tone: "muted",
-        },
-      ],
+      meta:
+        `${selected.length} line${selected.length === 1 ? "" : "s"}` +
+        (selected.length < allLines.length ? ` of ${allLines.length}` : ""),
     };
   },
 };

@@ -49,22 +49,31 @@ describe("formatToolCall", () => {
 });
 
 describe("diffLines (spec §14.4 P0)", () => {
-  it("shows only the changed region, with context around it", () => {
+  it("shows only the changed region, with line numbers and context", () => {
     const before = "a\nb\nc\nd\ne";
     const after = "a\nb\nCHANGED\nd\ne";
     expect(diffLines(before, after, 1)).toEqual([
-      { text: "  b", tone: "muted" },
-      { text: "- c", tone: "removed" },
-      { text: "+ CHANGED", tone: "added" },
-      { text: "  d", tone: "muted" },
+      { text: "2   b", tone: "muted", code: "none" },
+      { text: "3 - c", tone: "removed", code: "none" },
+      { text: "3 + CHANGED", tone: "added", code: "none" },
+      { text: "4   d", tone: "muted", code: "none" },
     ]);
+  });
+
+  it("widens the gutter so markers stay aligned in a long file", () => {
+    const before = Array.from({ length: 120 }, (_, i) => `line ${i}`).join("\n");
+    const after = before.replace("line 100", "CHANGED");
+    const rows = diffLines(before, after, 0);
+    // Three digits of line number, then the marker column.
+    expect(rows[0].text).toBe("101 - line 100");
+    expect(rows[1].text).toBe("101 + CHANGED");
   });
 
   it("renders a brand new file as all additions", () => {
     expect(diffLines("", "x\ny", 0)).toEqual([
-      { text: "- ", tone: "removed" },
-      { text: "+ x", tone: "added" },
-      { text: "+ y", tone: "added" },
+      { text: "1 - ", tone: "removed", code: "none" },
+      { text: "1 + x", tone: "added", code: "none" },
+      { text: "2 + y", tone: "added", code: "none" },
     ]);
   });
 
@@ -79,8 +88,8 @@ describe("diffLines (spec §14.4 P0)", () => {
 
   it("handles a change touching the very first and last line", () => {
     expect(diffLines("old", "new", 0)).toEqual([
-      { text: "- old", tone: "removed" },
-      { text: "+ new", tone: "added" },
+      { text: "1 - old", tone: "removed", code: "none" },
+      { text: "1 + new", tone: "added", code: "none" },
     ]);
   });
 });

@@ -107,3 +107,22 @@ export function displayPos(text: string, columns: number, tabSize = 8): DisplayP
   const cols = offset % width;
   return { rows: rows + (offset - cols) / width, cols };
 }
+
+/**
+ * The substring occupying display columns `[from, from + width)`.
+ *
+ * Needed because a single-line input has to scroll horizontally: text that
+ * overflows its box wraps in the terminal, the row silently becomes two,
+ * and every erase after that is short by one row (spec §16.2).
+ */
+export function sliceByWidth(text: string, from: number, width: number): string {
+  let column = 0;
+  let out = "";
+  for (const char of text) {
+    const size = charWidth(char);
+    if (column >= from && column + size <= from + width) out += char;
+    column += size;
+    if (column >= from + width) break;
+  }
+  return out;
+}

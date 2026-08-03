@@ -233,3 +233,51 @@ describe("editor: rendering (spec §16.2)", () => {
     expect(lines[3]).toContain("send");
   });
 });
+
+describe("editor: long input scrolls instead of overflowing (spec §16.2)", () => {
+  it("never renders a row wider than the box", () => {
+    // A row wider than its box wraps, silently becomes two screen rows, and
+    // every erase afterwards is one row short — the frame then leaves a
+    // trail of box borders behind it.
+    const ed = editor({ columns: () => 60 });
+    type(ed, "x".repeat(300));
+    const widths = new Set(ed.render().lines.map((line) => displayWidth(line)));
+    expect(widths).toEqual(new Set([59]));
+  });
+
+  it("keeps the cursor inside the box while typing past its width", () => {
+    const ed = editor({ columns: () => 60 });
+    type(ed, "y".repeat(300));
+    const region = ed.render();
+    expect(region.cursorCol).toBeLessThan(59);
+    expect(region.cursorCol).toBeGreaterThan(0);
+  });
+
+  it("shows the end of the line, which is where the cursor is", () => {
+    const ed = editor({ columns: () => 60 });
+    type(ed, `${"a".repeat(200)}TAIL`);
+    expect(ed.render().lines[1]).toContain("TAIL");
+  });
+
+  it("scrolls back when the cursor moves left", () => {
+    const ed = editor({ columns: () => 60 });
+    type(ed, `HEAD${"a".repeat(200)}`);
+    for (let at = 0; at < 220; at++) ed.handleKey(undefined, key("left"));
+    expect(ed.render().lines[1]).toContain("HEAD");
+  });
+
+  it("holds the box width with CJK text past the edge", () => {
+    const ed = editor({ columns: () => 60 });
+    type(ed, "中".repeat(100));
+    const widths = new Set(ed.render().lines.map((line) => displayWidth(line)));
+    expect(widths).toEqual(new Set([59]));
+  });
+
+  it("stays inside a narrow window with no box either", () => {
+    const ed = editor({ columns: () => 20 });
+    type(ed, "z".repeat(80));
+    const region = ed.render();
+    expect(displayWidth(region.lines[0])).toBeLessThanOrEqual(20);
+    expect(region.cursorCol).toBeLessThan(20);
+  });
+});

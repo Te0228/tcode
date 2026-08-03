@@ -42,10 +42,14 @@ export interface SpawnAgentDeps {
   runTurn?: typeof runTurn;
 }
 
+/** Marked so its call line prints before execution: it streams the
+ * subagent's progress, which would otherwise appear above its own heading
+ * (spec §16.9). */
 export function createSpawnAgentTool(spawn: SpawnAgentDeps): Tool {
   const run = spawn.runTurn ?? runTurn;
 
   return {
+    streamsOutput: true,
     schema: {
       name: SPAWN_AGENT_TOOL_NAME,
       description:

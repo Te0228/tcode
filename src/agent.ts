@@ -30,6 +30,7 @@ import { FINISH_TOOL_NAME, finishPayloadOf, type FinishPayload } from "./tools/f
 import { BASE_TOOLS, type ToolRegistry } from "./tools/index.js";
 import { normalizeToolReturn, truncateOutput } from "./tools/types.js";
 import { formatToolCall, formatToolResult, outputLines } from "./ui/format.js";
+import { boxWidth } from "./ui/chrome.js";
 import { NO_COLOR_PALETTE, type Palette } from "./ui/theme.js";
 import type { Activity } from "./ui/spinner.js";
 
@@ -65,6 +66,8 @@ export interface RunTurnOptions {
   /** What the agent is doing right now, for the spinner (spec §14.4 P2).
    * The REPL owns the timer; the loop only reports transitions. */
   onActivity?: (activity: Activity | null) => void;
+  /** Terminal width, for the right-aligned outcome column (spec §16.9). */
+  columns?: () => number;
   /** Semantic colours (spec §14). Defaults to no colour, so a caller that
    * has not decided — tests, subagents — never emits escape sequences. */
   palette?: Palette;
@@ -114,6 +117,12 @@ export function summaryLineOf(toolUse: ToolUseBlock): string {
     default:
       return `· ${toolUse.name}`;
   }
+}
+
+/** One line per tool call: the action, and its outcome on the right edge
+ * (spec §16.9). */
+function callLine(toolUse: ToolUseBlock, palette: Palette, meta: string, width: number): string {
+  return formatToolCall(summaryLineOf(toolUse), palette, meta, width);
 }
 
 function errorMessageOf(error: unknown): string {
@@ -174,6 +183,7 @@ async function executeToolUse(
   tracer: Tracer,
   signal: AbortSignal | undefined,
   palette: Palette,
+  width: number,
 ): Promise<ToolResultBlock> {
   const tool = tools[toolUse.name];
   if (!tool) {
@@ -201,6 +211,11 @@ async function executeToolUse(
     );
     const content = truncateOutput(outcome.result, deps.config.maxOutputChars);
 
+    // The call line waits for the result so the outcome can sit on it,
+    // right-aligned (spec §16.9). A tool that prints while it runs already
+    // printed its heading.
+    if (!tool.streamsOutput) log(callLine(toolUse, palette, outcome.meta ?? "", width));
+
     // Two separate paths on purpose (spec §14.4 P0): the model gets the
     // full result, the user gets a summary capped at a few lines. Neither
     // truncation touches the other.
@@ -218,6 +233,7 @@ async function executeToolUse(
     // Tool failures are fed back to the model as is_error so it can retry
     // or change approach — they never crash the turn (spec §3).
     const content = truncateOutput(errorMessageOf(error), deps.config.maxOutputChars);
+    if (!tool.streamsOutput) log(callLine(toolUse, palette, "failed", width));
     for (const line of formatToolResult(outputLines(content, "error"), palette)) log(line);
     tracer.emit("tool_result", {
       id: toolUse.id,
@@ -274,6 +290,9 @@ export async function runTurn(
   const tracer = options.tracer ?? NOOP_TRACER;
   const palette = options.palette ?? NO_COLOR_PALETTE;
   const activity = options.onActivity ?? (() => {});
+  // Fixed for the turn: re-measuring per line would make the right-aligned
+  // column jump if the window is resized mid-turn.
+  const width = boxWidth(options.columns?.() ?? 80);
   const turnStartedAt = Date.now();
 
   // Streamed text has no trailing newline of its own; remember whether we
@@ -403,7 +422,8 @@ export async function runTurn(
     // writes in one batch can't race each other (spec §3).
     const results: ToolResultBlock[] = [];
     for (const toolUse of toolUses) {
-      status(formatToolCall(summaryLineOf(toolUse), palette));
+      if (tools[toolUse.name]?.streamsOutput) status(callLine(toolUse, palette, "", width));
+      else status("");
       tracer.emit("tool_call", { id: toolUse.id, name: toolUse.name, input: toolUse.input });
 
       if (deps.approval.needsConfirmation(toolUse)) {
@@ -432,7 +452,7 @@ export async function runTurn(
         if (typeof target === "string") changedFiles.add(target);
       }
       results.push(
-        await executeToolUse(toolUse, tools, deps, log, tracer, options.signal, palette),
+        await executeToolUse(toolUse, tools, deps, log, tracer, options.signal, palette, width),
       );
       activity(null);
     }

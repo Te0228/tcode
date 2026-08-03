@@ -67,14 +67,18 @@ export const bashTool: Tool = {
     // What the user sees on failure is the exit code and stderr — the
     // reason. On success it is stdout, the thing they asked for. Before
     // this, both cases showed nothing and looked identical (spec §14.1).
+    // The exit code rides on the call line now (spec §16.9), so the block
+    // below carries only the reason: stderr on failure, stdout otherwise.
     const display: DisplayLine[] = failed
-      ? [
-          { text: `exit ${result.exitCode}`, tone: "error" },
-          ...outputLines(result.stderr || result.stdout, "error"),
-        ]
+      ? outputLines(result.stderr || result.stdout, "error")
       : outputLines(result.stdout);
 
-    return { result: `exit code: ${result.exitCode}\n${streams}`, display, failed };
+    return {
+      result: `exit code: ${result.exitCode}\n${streams}`,
+      display,
+      failed,
+      meta: `exit ${result.exitCode}`,
+    };
   },
 };
 
