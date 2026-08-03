@@ -29,9 +29,26 @@ describe("parseCommand (spec §15.3)", () => {
 });
 
 describe("help (spec §15.3)", () => {
-  it("lists every command that exists", () => {
+  it("lists every command that exists, minus the pure aliases", () => {
     const help = renderHelp(NO_COLOR_PALETTE).join("\n");
-    for (const command of COMMANDS) expect(help).toContain(`/${command.name}`);
+    for (const command of COMMANDS) {
+      if (command.name === "quit") continue; // alias for /exit; listing both is noise
+      expect(help, command.name).toContain(`/${command.name}`);
+    }
+  });
+
+  it("covers what the tool can actually do (spec §17.5c)", () => {
+    // The command set is derived from tcode's capabilities, not copied from
+    // another tool: anything reachable only by restarting the process needs
+    // a command.
+    const names = COMMANDS.map((command) => command.name);
+    for (const expected of [
+      "model", "context", "compact", "diff", "undo", "retry",
+      "memory", "init", "tools", "approvals", "view", "export",
+      "sessions", "resume", "new", "clear", "status",
+    ]) {
+      expect(names, expected).toContain(expected);
+    }
   });
 
   it("documents the keys, which are otherwise undiscoverable", () => {

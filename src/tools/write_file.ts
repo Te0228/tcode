@@ -35,6 +35,7 @@ export const writeFileTool: Tool = {
       result: `${verb} ${inputPath} (${content.length} chars) ${diffStat(before, content)}`,
       display: diffLines(before, content, 2, detectLanguage(inputPath)),
       meta: diffStat(before, content),
+      undo: { path: inputPath, previous: existed ? before : null },
     };
   },
 };

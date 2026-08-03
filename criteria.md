@@ -229,6 +229,17 @@ P3 —— markdown:
 - [x] 光标始终停在输入行(菜单在它上方)
 - [x] 轮次序号只数用户自己发的消息——steering 和中断说明也是 role user,算进去会让序号翻倍
 
+## 7.12 完整命令集(§17.5c)
+
+- [x] 命令集由 tcode 的实际能力推导:凡是只能靠重启进程或改环境变量才能触达的,都有一条命令
+- [x] `/model <name>` **真的切换** provider,不是只显示;历史照常接续(归一化格式)
+- [x] `/undo` 把最近一轮改过的文件放回去(不存在的删掉),只保留一轮
+- [x] `/undo` 的快照由工具在 `ToolOutcome` 里回报——只有它知道改动前是什么
+- [x] `/diff` 在 git 仓库里用 `git diff`,否则列出本会话写过的文件
+- [x] `/export` 产出可读 markdown(会话本身是 JSON,那是用来重放的)
+- [x] `/status` `/tools` `/approvals` `/memory` `/view` `/retry` `/init` `/clear` 各自生效
+- [x] `/quit` 是 `/exit` 的别名,`/help` 里不重复列出
+
 ## 8. 测试基础设施本身(§12)
 
 - [x] `tests/unit/` 覆盖 `security`/`edit_file`/`session`/`adapters`/`approval`/`spawn_agent`,且都能独立运行、不需要网络

@@ -4,6 +4,7 @@
  * the readline REPL, and session load/save. All agent behavior lives in
  * `agent.ts`, so swapping this for a TUI later touches nothing else.
  */
+import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { PassThrough } from "node:stream";
@@ -12,7 +13,9 @@ import { createApprovalPolicy } from "./approval.js";
 import { loadConfig, loadEnvFiles, userConfigDir } from "./config.js";
 import { estimateTokens, formatTokens } from "./tokens.js";
 import { budgetWarning, buildSendView, computeBudget } from "./context.js";
-import { createSend, MissingApiKeyError, resolveProviderConfig } from "./llm/index.js";
+import { createSend, MissingApiKeyError, PROVIDERS, resolveProviderConfig } from "./llm/index.js";
+import { executor } from "./executor.js";
+import { resolveInRoot } from "./security.js";
 import { loadMemory } from "./memory.js";
 import { buildSystemPrompt } from "./prompt.js";
 import {
@@ -38,10 +41,10 @@ import { isInterruptKey } from "./ui/keys.js";
 import { createLiveScreen, type InputRegion } from "./ui/live-screen.js";
 import { createEditor, type Key } from "./ui/editor.js";
 import { createSelect } from "./ui/select.js";
-import { header, turnHeading } from "./ui/chrome.js";
+import { header, shortenPath, turnHeading } from "./ui/chrome.js";
 import { createTranscript } from "./ui/transcript.js";
 import { createSpinner, SPINNER_INTERVAL_MS, type Activity } from "./ui/spinner.js";
-import { colorEnabled, createPalette, type Palette } from "./ui/theme.js";
+import { colorEnabled, colorLevel, createPalette, type Palette } from "./ui/theme.js";
 import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
 import { startViewer } from "./viewer/server.js";
 
@@ -329,6 +332,12 @@ async function main(): Promise<void> {
 
   let contextTokens = 0;
   let turnRunning = false;
+  const startedSession = Date.now();
+  /** Files this session is known to have written, for `/diff` outside a git
+   * repo where there is no baseline to compare against. */
+  const changedThisSession = new Set<string>();
+  /** Enough to put the last turn back (spec §17.5c). One turn only. */
+  let lastUndo: { path: string; previous: string | null }[] = [];
 
   const live = createLiveScreen({
     write: (text) => process.stdout.write(text),
@@ -699,28 +708,183 @@ async function main(): Promise<void> {
   const runCommand = async (command: { name: string; args: string }): Promise<"ok" | "exit"> => {
     switch (command.name) {
       case "help":
-        for (const line of renderHelp(palette)) log(line);
+        for (const entry of renderHelp(palette)) log(entry);
         return "ok";
 
       case "exit":
+      case "quit":
         return "exit";
 
-      case "model":
-        log(`${providerConfig.provider}/${providerConfig.model}`);
-        log(
-          palette.meta(
-            `  switch with PROVIDER=<name> when starting tcode; see ${path.join(userConfigDir(), ".env")}`,
-          ),
-        );
+      case "clear":
+        // The screen, not the history: scrollback is the audit record
+        // (spec §16.1), so this clears the view and nothing else.
+        process.stdout.write("\u001b[2J\u001b[H");
+        live.refresh();
         return "ok";
 
+      case "status": {
+        const uptime = Math.round((Date.now() - startedSession) / 1000);
+        for (const [label, value] of [
+          ["provider", `${providerConfig.provider}/${providerConfig.model}`],
+          ["project", shortenPath(root)],
+          ["session", `${session.id} · ${session.messages.length} messages`],
+          ["running", `${Math.floor(uptime / 60)}m ${uptime % 60}s`],
+          ["memory", memory.layers.length ? memory.layers.map((l) => l.scope).join(", ") : "none"],
+          ["approvals", args.fullAuto ? "full-auto (never asks)" : "asks before writing outside the project"],
+          ["colour", colorLevel(colorOptions)],
+        ] as [string, string][]) {
+          log(`  ${label.padEnd(10)} ${palette.meta(value)}`);
+        }
+        return "ok";
+      }
+
+      case "model": {
+        if (!command.args) {
+          log(`${providerConfig.provider}/${providerConfig.model}`);
+          log(palette.meta(`  available: ${Object.keys(PROVIDERS).join(", ")}`));
+          log(palette.meta(`  switch with:  /model <provider>`));
+          return "ok";
+        }
+        try {
+          // A real switch, not a printout: otherwise changing model still
+          // means quitting and editing the environment (spec §17.5c).
+          const next = resolveProviderConfig({ ...process.env, PROVIDER: command.args });
+          providerConfig = next;
+          deps.send = createSend(next);
+          deps.contextWindowTokens = next.contextWindowTokens;
+          log(palette.success(`✓ now using ${next.provider}/${next.model}`));
+          log(palette.meta("  the history carries over — it is stored normalized, not per-provider"));
+        } catch (error) {
+          log(palette.error(error instanceof Error ? error.message : String(error)));
+        }
+        return "ok";
+      }
+
+      case "tools": {
+        for (const tool of Object.values(tools)) {
+          log(`  ${palette.accent2(tool.schema.name.padEnd(12))} ${palette.meta(firstSentence(tool.schema.description))}`);
+        }
+        return "ok";
+      }
+
+      case "approvals": {
+        log(
+          args.fullAuto
+            ? palette.warn("full-auto — nothing is confirmed")
+            : "asks before: writing outside the project, sudo, system commands, git push",
+        );
+        log(palette.meta("  reading anything, and writing inside the project, never ask"));
+        log(palette.meta("  start with --full-auto to skip all confirmation"));
+        return "ok";
+      }
+
+      case "memory": {
+        if (memory.layers.length === 0) {
+          log("no AGENTS.md loaded");
+          log(palette.meta(`  /init writes one for this project`));
+          return "ok";
+        }
+        for (const layer of memory.layers) {
+          log(`${palette.accent2(layer.scope)}  ${palette.meta(layer.file)}`);
+          for (const entry of layer.content.trim().split("\n").slice(0, 8)) {
+            log(palette.meta(`  ${entry}`));
+          }
+        }
+        log(palette.meta(`  ${formatTokens(memory.tokens)} of the system prompt`));
+        return "ok";
+      }
+
+      case "diff": {
+        const result = await executor.run(
+          "git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git diff --stat && git diff",
+          { cwd: root, timeoutMs: config.commandTimeoutMs },
+        );
+        if (result.exitCode !== 0) {
+          // Not a git repo: fall back to what this session is known to have
+          // touched, which is all we can say without a baseline.
+          if (changedThisSession.size === 0) log("nothing changed yet in this session");
+          else for (const file of changedThisSession) log(`  ${file}`);
+          return "ok";
+        }
+        const body = result.stdout.trim();
+        if (!body) log("working tree is clean");
+        else for (const entry of body.split("\n").slice(0, 60)) log(palette.meta(entry));
+        return "ok";
+      }
+
+      case "undo": {
+        if (lastUndo.length === 0) {
+          log("nothing to undo — no files changed in the last turn");
+          return "ok";
+        }
+        for (const entry of lastUndo) {
+          try {
+            const target = resolveInRoot(root, entry.path);
+            if (entry.previous === null) fs.rmSync(target, { force: true });
+            else fs.writeFileSync(target, entry.previous);
+            log(palette.success(`✓ ${entry.previous === null ? "removed" : "restored"} ${entry.path}`));
+          } catch (error) {
+            log(palette.error(`${entry.path}: ${error instanceof Error ? error.message : String(error)}`));
+          }
+        }
+        lastUndo = [];
+        log(palette.meta("  the model still believes it made those changes; tell it what you undid"));
+        return "ok";
+      }
+
+      case "retry": {
+        const previous = [...session.messages]
+          .reverse()
+          .find((message) => message.role === "user" && message.content.every((b) => b.type === "text"));
+        const text = previous?.content
+          .map((block) => (block.type === "text" ? block.text : ""))
+          .join("");
+        if (!text) {
+          log("nothing to retry yet");
+          return "ok";
+        }
+        queued.push(text);
+        log(palette.meta(`resending: ${truncateForList(text)}`));
+        return "ok";
+      }
+
+      case "view": {
+        const url = await startViewer({ cwd: root, sessionId: session.id });
+        log(`${palette.accent2(url)}`);
+        log(palette.meta("  live while tcode runs here"));
+        return "ok";
+      }
+
+      case "export": {
+        const target = path.resolve(root, command.args || `tcode-${session.id}.md`);
+        try {
+          fs.writeFileSync(target, renderTranscriptMarkdown(session));
+          log(palette.success(`✓ ${path.relative(root, target)}`));
+        } catch (error) {
+          log(palette.error(error instanceof Error ? error.message : String(error)));
+        }
+        return "ok";
+      }
+
+      case "init": {
+        queued.push(
+          "Look at this project — its layout, language, build and test commands, and any " +
+            "conventions you can infer — then write a concise AGENTS.md at the project root " +
+            "describing what a coding agent needs to know to work here. Keep it short and " +
+            "specific; no filler. Then finish.",
+        );
+        log(palette.meta("scanning the project to write AGENTS.md…"));
+        return "ok";
+      }
+
       case "sessions": {
-        for (const line of sessionListLines(root, palette, session.id)) log(line);
+        for (const entry of sessionListLines(root, palette, session.id)) log(entry);
         return "ok";
       }
 
       case "new": {
         session = createSession(root, providerConfig.provider, providerConfig.model);
+        turnIndex = 0;
         log(palette.success(`✓ new session ${session.id}`));
         return "ok";
       }
@@ -734,6 +898,7 @@ async function main(): Promise<void> {
           return "ok";
         }
         session = target.session;
+        turnIndex = target.exchanges;
         log(
           palette.success(`✓ resumed ${session.id}`) +
             palette.meta(` · ${target.exchanges} messages`),
@@ -762,21 +927,19 @@ async function main(): Promise<void> {
           compactKeepRecent: config.compactKeepRecent,
           systemPromptTokens,
         };
-        const view = buildSendView(session, computeBudget(inputs));
-        log(palette.strong("context"));
+        const sendView = buildSendView(session, computeBudget(inputs));
         for (const [label, value] of [
           ["window", formatTokens(providerConfig.contextWindowTokens)],
           ["system prompt", formatTokens(systemPromptTokens)],
           ["  of which memory", formatTokens(memory.tokens)],
-          ["history (as sent)", formatTokens(view.tokens)],
+          ["history (as sent)", formatTokens(sendView.tokens)],
           ["reserved for reply", formatTokens(config.reservedOutputTokens)],
           ["messages", `${session.messages.length}`],
-          ["detail level", view.level],
+          ["detail level", sendView.level],
           ["compactions", `${(session.compactions ?? []).length}`],
         ] as [string, string][]) {
           log(`  ${label.padEnd(18)} ${palette.meta(value)}`);
         }
-        log("");
         return "ok";
       }
 
@@ -859,6 +1022,8 @@ async function main(): Promise<void> {
       }
       // What the user almost always does next is `git diff` or `git add`,
       // and reconstructing the list from the scrollback is busywork (§15.6).
+      lastUndo = result.undo;
+      for (const file of result.changedFiles) changedThisSession.add(file);
       if (result.changedFiles.length > 0) {
         log(
           palette.meta(
@@ -906,3 +1071,33 @@ main().catch((error) => {
   console.error(error);
   process.exit(1);
 });
+
+/** First sentence of a tool description — the schema text is written for
+ * the model and runs long. */
+function firstSentence(text: string): string {
+  const stop = text.indexOf(". ");
+  return stop === -1 ? text : text.slice(0, stop + 1);
+}
+
+/** The session as markdown, for `/export` (spec §17.5c). Sessions are JSON
+ * because that is what replays; this is what a person pastes elsewhere. */
+function renderTranscriptMarkdown(session: Session): string {
+  const parts = [`# tcode session ${session.id}`, "", `${session.provider}/${session.model}`, ""];
+  for (const message of session.messages) {
+    const text = message.content
+      .filter((block): block is { type: "text"; text: string } => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+    const tools = message.content.filter((block) => block.type === "tool_use");
+    if (message.role === "user" && text) parts.push(`## you`, "", text, "");
+    else if (message.role === "assistant" && (text || tools.length)) {
+      parts.push(`## tcode`, "");
+      if (text) parts.push(text, "");
+      for (const tool of tools) {
+        if (tool.type !== "tool_use") continue;
+        parts.push("```", `${tool.name} ${JSON.stringify(tool.input)}`, "```", "");
+      }
+    }
+  }
+  return parts.join("\n");
+}

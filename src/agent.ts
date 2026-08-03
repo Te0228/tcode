@@ -108,6 +108,10 @@ export interface TurnResult {
   /** Files this turn wrote, in the order first touched (spec §15.6). The
    * user's next step is almost always `git diff` or `git add`. */
   changedFiles: string[];
+  /** Enough to put those files back (spec §17.5c). First snapshot per path
+   * wins: undoing a turn means returning to how it started, not stepping
+   * back through each edit inside it. */
+  undo: { path: string; previous: string | null }[];
 }
 
 /** One-line "what the agent is doing now" summary (spec §3). */
@@ -192,6 +196,7 @@ async function executeToolUse(
   emit: (event: TurnEvent) => void,
   tracer: Tracer,
   signal: AbortSignal | undefined,
+  onUndo: (entry: { path: string; previous: string | null }) => void,
 ): Promise<ToolResultBlock> {
   const tool = tools[toolUse.name];
   if (!tool) {
@@ -222,6 +227,7 @@ async function executeToolUse(
     // Reported after the fact so the outcome can ride on the call line
     // (spec §16.9). Two separate paths on purpose (spec §14.4 P0): the
     // model gets `result` in full, the user gets `display`.
+    if (outcome.undo) onUndo(outcome.undo);
     emit({
       type: "tool_end",
       toolUse,
@@ -326,6 +332,7 @@ export async function runTurn(
   let lastViewTokens = 0;
   let announcedOmission = false;
   const changedFiles = new Set<string>();
+  const undo = new Map<string, string | null>();
 
   // Unbounded by default (spec §3). The old hard cap severed legitimate
   // long tasks — a whole-project migration is dozens of rounds of real
@@ -448,7 +455,9 @@ export async function runTurn(
         if (typeof target === "string") changedFiles.add(target);
       }
       results.push(
-        await executeToolUse(toolUse, tools, deps, emit, tracer, options.signal),
+        await executeToolUse(toolUse, tools, deps, emit, tracer, options.signal, (entry) => {
+          if (!undo.has(entry.path)) undo.set(entry.path, entry.previous);
+        }),
       );
     }
 
@@ -525,5 +534,12 @@ export async function runTurn(
     ...(finish ? { finish } : {}),
   });
 
-  return { outcome, finish, lastText, usage, changedFiles: [...changedFiles] };
+  return {
+    outcome,
+    finish,
+    lastText,
+    usage,
+    changedFiles: [...changedFiles],
+    undo: [...undo].map(([path, previous]) => ({ path, previous })),
+  };
 }

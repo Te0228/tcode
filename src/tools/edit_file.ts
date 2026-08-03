@@ -56,6 +56,7 @@ export const editFileTool: Tool = {
         result: `created ${inputPath} (${newString.length} chars)`,
         display: diffLines("", newString, 2, detectLanguage(inputPath)),
         meta: diffStat("", newString),
+        undo: { path: inputPath, previous: null },
       };
     }
 
@@ -90,6 +91,7 @@ export const editFileTool: Tool = {
       result: `edited ${inputPath}${suffix} ${diffStat(content, updated)}`,
       display: diffLines(content, updated, 2, detectLanguage(inputPath)),
       meta: diffStat(content, updated),
+      undo: { path: inputPath, previous: content },
     };
   },
 };

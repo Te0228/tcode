@@ -19,18 +19,26 @@ export interface CommandSpec {
 }
 
 export const COMMANDS: CommandSpec[] = [
-  { name: "help", summary: "list these commands" },
-  { name: "sessions", summary: "list sessions in this directory" },
-  {
-    name: "resume",
-    usage: "[id]",
-    summary: "switch to another session; without an id, pick from a list",
-  },
-  { name: "new", summary: "start an empty session here, without restarting" },
+  { name: "help", summary: "commands and keys" },
+  { name: "status", summary: "provider, session, memory and approval mode" },
+  { name: "model", usage: "[name]", summary: "show the active model, or switch to another" },
+  { name: "context", summary: "what is using the context window" },
   { name: "compact", summary: "summarize the history now instead of at the threshold" },
-  { name: "context", summary: "show what is using the context window" },
-  { name: "model", summary: "show the active provider and model" },
-  { name: "exit", summary: "quit (same as an empty line or Ctrl+D)" },
+  { name: "diff", summary: "what has changed on disk" },
+  { name: "undo", summary: "put back the files the last turn changed" },
+  { name: "retry", summary: "send the previous message again" },
+  { name: "memory", summary: "which AGENTS.md files are loaded" },
+  { name: "init", summary: "write a first AGENTS.md for this project" },
+  { name: "tools", summary: "what this agent can do" },
+  { name: "approvals", summary: "when tcode asks before running something" },
+  { name: "view", summary: "open this session in the browser viewer" },
+  { name: "export", usage: "[file]", summary: "write the transcript as markdown" },
+  { name: "sessions", summary: "list sessions in this directory" },
+  { name: "resume", usage: "[id]", summary: "switch session; without an id, pick from a list" },
+  { name: "new", summary: "start an empty session here" },
+  { name: "clear", summary: "clear the screen" },
+  { name: "exit", summary: "quit" },
+  { name: "quit", summary: "quit" },
 ];
 
 export interface ParsedCommand {
@@ -74,6 +82,8 @@ export function renderHelp(palette: Palette): string[] {
   const width = Math.max(...COMMANDS.map((command) => nameOf(command).length));
   const lines = [palette.strong("commands")];
   for (const command of COMMANDS) {
+    // `/quit` is a pure alias; listing it twice is noise.
+    if (command.name === "quit") continue;
     lines.push(`  ${nameOf(command).padEnd(width)}  ${palette.meta(command.summary)}`);
   }
 

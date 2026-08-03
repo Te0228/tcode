@@ -58,6 +58,10 @@ export interface ToolOutcome {
   /** Right-aligned outcome on the tool's call line: `128 lines`, `+3 -1`,
    * `exit 1` (spec §16.9). */
   meta?: string;
+  /** What this file looked like before the tool touched it, so the turn can
+   * be put back (spec §17.5c). `null` means it did not exist. Only the tool
+   * knows this, which is why it reports it rather than being asked. */
+  undo?: { path: string; previous: string | null };
 }
 
 export type ToolReturn = string | ToolOutcome;
