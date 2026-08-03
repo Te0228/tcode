@@ -7,12 +7,11 @@
 import path from "node:path";
 import readline from "node:readline";
 import { PassThrough } from "node:stream";
-import { compactNow, runTurn, type AgentDeps } from "./agent.js";
+import { compactNow, runTurn, summaryLineOf, type AgentDeps } from "./agent.js";
 import { createApprovalPolicy } from "./approval.js";
 import { loadConfig, loadEnvFiles, userConfigDir } from "./config.js";
 import { estimateTokens, formatTokens } from "./tokens.js";
 import { budgetWarning, buildSendView, computeBudget } from "./context.js";
-import { alignRight } from "./ui/chrome.js";
 import { createSend, MissingApiKeyError, resolveProviderConfig } from "./llm/index.js";
 import { loadMemory } from "./memory.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -39,7 +38,8 @@ import { isInterruptKey } from "./ui/keys.js";
 import { createLiveScreen, type InputRegion } from "./ui/live-screen.js";
 import { createEditor, type Key } from "./ui/editor.js";
 import { createSelect } from "./ui/select.js";
-import { GUTTER_WIDTH, header, rail, turnHeading } from "./ui/chrome.js";
+import { header, turnHeading } from "./ui/chrome.js";
+import { createTranscript } from "./ui/transcript.js";
 import { createSpinner, SPINNER_INTERVAL_MS, type Activity } from "./ui/spinner.js";
 import { colorEnabled, createPalette, type Palette } from "./ui/theme.js";
 import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
@@ -354,15 +354,24 @@ async function main(): Promise<void> {
   };
 
   const write = (text: string) => live.write(text);
-  /** Every line inside a turn hangs off the rail (spec §17.3), so nothing
-   * indents on its own and a turn reads as one block. */
-  const bodyRail = () => rail("body", palette, colored);
-  const log = (line: string) => write(`${bodyRail()}${line}\n`);
-  /** Outside a turn — headings and the blank lines between turns. */
-  const logBare = (line: string) => write(`${line}\n`);
+  const layoutWidth = () => Math.min(100, Math.max(20, columns() - 1));
+  const colored = colorEnabled(colorOptions);
 
-  let turnIndex = (session.messages ?? []).filter((message) =>
-    message.content.some((block) => block.type === "text" && message.role === "user"),
+  // One renderer owns the whole transcript (spec §17.6): the rail, the
+  // gutter, markdown, tints. Nothing else formats a line.
+  const view = createTranscript({
+    palette,
+    colored,
+    width: layoutWidth,
+    write,
+    rewritePending: (text) => live.rewritePending(text),
+    renderMarkdown: colored,
+  });
+
+  const log = (text: string) => view.note(text);
+
+  let turnIndex = session.messages.filter(
+    (message) => message.role === "user" && message.content.some((block) => block.type === "text"),
   ).length;
 
   const clock = () => {
@@ -371,34 +380,7 @@ async function main(): Promise<void> {
   };
 
   const heading = (role: "you" | "tcode", detail: string) =>
-    logBare(turnHeading({ index: turnIndex, role, detail }, layoutWidth(), palette, colored));
-
-  // Assistant text, rendered a line at a time (spec §14.4 P3). Half a line
-  // still streams out immediately — §3.2 wins on that — and is swapped for
-  // the rendered version once its newline arrives.
-  //
-  // Only when colour is on. With it off, rendering would strip the `**` and
-  // backticks and put nothing in their place, quietly editing the model's
-  // words on the way into a pipe.
-  const markdown = createMarkdownRenderer(palette);
-  let textBuffer = "";
-  const writeText = colorEnabled(colorOptions)
-    ? (chunk: string) => {
-        textBuffer += chunk;
-        let breakAt = textBuffer.indexOf("\n");
-        while (breakAt >= 0) {
-          const line = textBuffer.slice(0, breakAt);
-          textBuffer = textBuffer.slice(breakAt + 1);
-          live.rewritePending("");
-          log(markdown.render(line));
-          breakAt = textBuffer.indexOf("\n");
-        }
-        // Pending always mirrors the buffer, so the two can never disagree
-        // about what is already on screen — and it hangs off the rail like
-        // every other line inside a turn (spec §17.3).
-        live.rewritePending(textBuffer ? `${bodyRail()}${textBuffer}` : "");
-      }
-    : write;
+    view.heading(turnHeading({ index: turnIndex, role, detail }, layoutWidth(), palette, colored));
 
   let closed = false;
 
@@ -424,12 +406,12 @@ async function main(): Promise<void> {
       awaitingMessage = null;
       turnIndex += 1;
       heading("you", clock());
-      for (const line of text.split("\n")) log(palette.userInput(line));
+      for (const part of text.split("\n")) log(palette.userInput(part));
       resolve(text);
       return;
     }
     queued.push(text);
-    for (const line of text.split("\n")) log(palette.userInput(line));
+    for (const part of text.split("\n")) log(palette.userInput(part));
     log(palette.meta(`queued (${queued.length}) — joins this turn at the next step`));
   };
 
@@ -604,8 +586,11 @@ async function main(): Promise<void> {
     const expanded = expandMentions(args.print, root, config.maxOutputChars);
     const result = await runTurn(session, expanded.text, deps, {
       tools,
-      log: (line) => process.stdout.write(`${line}\n`),
-      writeText: (chunk) => process.stdout.write(chunk),
+      onEvent: (event) => {
+        if (event.type === "text") process.stdout.write(event.chunk);
+        else if (event.type === "tool_end") process.stdout.write(`${summaryLineOf(event.toolUse)}\n`);
+        else if (event.type === "notice") process.stdout.write(`${event.text}\n`);
+      },
       persist: saveSession,
       tracer,
     });
@@ -613,8 +598,6 @@ async function main(): Promise<void> {
       process.exit(result.outcome === "finished" || result.outcome === "no_tool_use" ? 0 : 1);
   }
 
-  const layoutWidth = () => Math.min(100, Math.max(20, columns() - 1));
-  const colored = colorEnabled(colorOptions);
   console.log(
     header(
       {
@@ -658,7 +641,7 @@ async function main(): Promise<void> {
   // reads as a suggestion to act rather than a stray line.
   if (interactive && turnIndex === 0) {
     log(palette.meta(`try \`fix the failing test\` — or type \`/help\` to see commands`));
-    logBare("");
+    view.blank();
   }
 
   // Input typed while a turn is running is queued for the next one, and
@@ -755,7 +738,9 @@ async function main(): Promise<void> {
       case "compact": {
         setActivity({ kind: "compacting" });
         try {
-          if (await compactNow(session, deps, log, tracer)) saveSession(session);
+          if (await compactNow(session, deps, (_level, text) => log(text), tracer)) {
+            saveSession(session);
+          }
         } finally {
           setActivity(null);
         }
@@ -843,15 +828,12 @@ async function main(): Promise<void> {
     controller = new AbortController();
     turnRunning = true;
     const startedAt = Date.now();
-    logBare("");
+    view.blank();
     heading("tcode", clock());
     try {
       const result = await runTurn(session, expanded.text, deps, {
         tools,
-        log,
-        writeText,
-        palette,
-        contentWidth: () => layoutWidth() - GUTTER_WIDTH,
+        onEvent: (event) => view.event(event),
         onActivity: setActivity,
         persist: saveSession,
         tracer,
@@ -865,16 +847,9 @@ async function main(): Promise<void> {
       if (result.finish) {
         const blocked = result.finish.status === "blocked";
         const mark = blocked ? palette.warn("⚠") : palette.success("✓");
-        log("");
-        log(
-          alignRight(
-            `${mark} ${result.finish.summary}`,
-            palette.meta(`${clock()} · ${elapsed}`),
-            layoutWidth() - GUTTER_WIDTH,
-          ),
-        );
+        view.outcome(`${mark} ${result.finish.summary}`, `${clock()} · ${elapsed}`);
       } else if (result.outcome === "interrupted") {
-        log(palette.warn("⎋ interrupted"));
+        view.outcome(palette.warn("⎋ interrupted"), `${clock()} · ${elapsed}`);
       }
       // What the user almost always does next is `git diff` or `git add`,
       // and reconstructing the list from the scrollback is busywork (§15.6).
@@ -889,7 +864,7 @@ async function main(): Promise<void> {
       // The status bar carries context usage permanently now (spec §16.2);
       // announcing it again every turn would be repeating what is on screen.
       contextTokens = result.usage.tokens;
-      logBare("");
+      view.blank();
     } catch (error) {
       // Keep the REPL alive on an API/network failure — the session is
       // still on disk and the user can retry.
@@ -898,7 +873,7 @@ async function main(): Promise<void> {
       // Through `log`, not console.error: the input line is still drawn,
       // and a raw write would land inside it.
       log(palette.error(`turn failed: ${message}`));
-      logBare("");
+      view.blank();
       saveSession(session);
     } finally {
       controller = null;

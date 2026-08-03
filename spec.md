@@ -402,6 +402,8 @@ src/
                       # 渲染成"行 + 光标位置"交给 live-screen 画
     select.ts         # 单键选择的覆盖层(见 16.6):确认框、会话选择器共用
     highlight.ts      # 粗粒度语法高亮(见 16.8)。五类着色,认不出语言就不高亮
+    transcript.ts     # 对话区渲染器(见 17.6):边杆、轨道宽度、折行、markdown、背景微染。
+                      # agent.ts 只发事件,版式只在这里实现一次
     live-screen.ts    # 屏幕底部区域(见 3.2/16.2):输出/半行/spinner/输入区的擦除与重画
     width.ts          # displayWidth(text) / displayPos(text, cols):按显示宽度算列数(CJK 占 2),
                       # 先剥 ANSI。算法刻意和 readline 内部的 kGetDisplayPos 一致——输入行归它画,

@@ -135,12 +135,6 @@ export function summaryLineOf(toolUse: ToolUseBlock): string {
   }
 }
 
-/** One line per tool call: the action, and its outcome on the right edge
- * (spec §16.9). */
-function callLine(toolUse: ToolUseBlock, palette: Palette, meta: string, width: number): string {
-  return formatToolCall(summaryLineOf(toolUse), palette, meta, width);
-}
-
 function errorMessageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -158,11 +152,11 @@ async function compact(
   cutIndex: number,
   tokensBefore: number,
   deps: AgentDeps,
-  status: (line: string) => void,
+  notice: (level: "info" | "warn", text: string) => void,
   tracer: Tracer,
 ): Promise<boolean> {
   const transcript = renderForSummary(session.messages.slice(0, cutIndex));
-  status(`⋯ compacting ${cutIndex} earlier messages to free context`);
+  notice("info", `compacting ${cutIndex} earlier messages to free context`);
 
   try {
     const response = await deps.send(
@@ -186,7 +180,7 @@ async function compact(
     return true;
   } catch (error) {
     tracer.emit("compaction", { upToIndex: cutIndex, tokensBefore, ok: false, error: errorMessageOf(error) });
-    status(`⚠ compaction failed (${errorMessageOf(error)}); continuing with omitted tool output`);
+    notice("warn", `compaction failed (${errorMessageOf(error)}); continuing with omitted tool output`);
     return false;
   }
 }
@@ -195,11 +189,9 @@ async function executeToolUse(
   toolUse: ToolUseBlock,
   tools: ToolRegistry,
   deps: AgentDeps,
-  log: (line: string) => void,
+  emit: (event: TurnEvent) => void,
   tracer: Tracer,
   signal: AbortSignal | undefined,
-  palette: Palette,
-  width: number,
 ): Promise<ToolResultBlock> {
   const tool = tools[toolUse.name];
   if (!tool) {
@@ -220,22 +212,23 @@ async function executeToolUse(
       await tool.execute(input, {
         root: deps.root,
         config: deps.config,
-        log,
+        log: (line: string) => emit({ type: "notice", level: "info", text: line }),
         tracer,
         signal,
       }),
     );
     const content = truncateOutput(outcome.result, deps.config.maxOutputChars);
 
-    // The call line waits for the result so the outcome can sit on it,
-    // right-aligned (spec §16.9). A tool that prints while it runs already
-    // printed its heading.
-    if (!tool.streamsOutput) log(callLine(toolUse, palette, outcome.meta ?? "", width));
-
-    // Two separate paths on purpose (spec §14.4 P0): the model gets the
-    // full result, the user gets a summary capped at a few lines. Neither
-    // truncation touches the other.
-    for (const line of formatToolResult(outcome.display ?? [], palette, undefined, width)) log(line);
+    // Reported after the fact so the outcome can ride on the call line
+    // (spec §16.9). Two separate paths on purpose (spec §14.4 P0): the
+    // model gets `result` in full, the user gets `display`.
+    emit({
+      type: "tool_end",
+      toolUse,
+      meta: outcome.meta ?? "",
+      display: outcome.display ?? [],
+      failed: outcome.failed === true,
+    });
 
     tracer.emit("tool_result", {
       id: toolUse.id,
@@ -249,8 +242,13 @@ async function executeToolUse(
     // Tool failures are fed back to the model as is_error so it can retry
     // or change approach — they never crash the turn (spec §3).
     const content = truncateOutput(errorMessageOf(error), deps.config.maxOutputChars);
-    if (!tool.streamsOutput) log(callLine(toolUse, palette, "failed", width));
-    for (const line of formatToolResult(outputLines(content, "error"), palette)) log(line);
+    emit({
+      type: "tool_end",
+      toolUse,
+      meta: "failed",
+      display: content.split("\n").map((text) => ({ text, tone: "error" as const })),
+      failed: true,
+    });
     tracer.emit("tool_result", {
       id: toolUse.id,
       name: toolUse.name,
@@ -270,7 +268,7 @@ async function executeToolUse(
 export async function compactNow(
   session: Session,
   deps: AgentDeps,
-  log: (line: string) => void,
+  notice: (level: "info" | "warn", text: string) => void,
   tracer: Tracer = NOOP_TRACER,
 ): Promise<boolean> {
   const budget = computeBudget({
@@ -288,10 +286,10 @@ export async function compactNow(
     view.suggestedCutIndex ??
     findCutIndex(session.messages, session.messages.length - deps.config.compactKeepRecent);
   if (cutIndex <= (session.compactions?.at(-1)?.upToIndex ?? 0)) {
-    log("nothing to compact yet — the history is still short");
+    notice("info", "nothing to compact yet — the history is still short");
     return false;
   }
-  return compact(session, cutIndex, view.tokens, deps, log, tracer);
+  return compact(session, cutIndex, view.tokens, deps, notice, tracer);
 }
 
 export async function runTurn(
@@ -301,32 +299,15 @@ export async function runTurn(
   options: RunTurnOptions = {},
 ): Promise<TurnResult> {
   const tools = options.tools ?? BASE_TOOLS;
-  const log = options.log ?? ((line: string) => console.log(line));
+  const emit = options.onEvent ?? (() => {});
   const persist = options.persist ?? saveSession;
   const tracer = options.tracer ?? NOOP_TRACER;
-  const palette = options.palette ?? NO_COLOR_PALETTE;
   const activity = options.onActivity ?? (() => {});
-  // Fixed for the turn: re-measuring per line would make the right-aligned
-  // column jump if the window is resized mid-turn.
-  const width = options.contentWidth?.() ?? 76;
   const turnStartedAt = Date.now();
 
-  // Streamed text has no trailing newline of its own; remember whether we
-  // left the cursor mid-line so status lines start cleanly.
-  let textOpen = false;
-  const writeText =
-    options.writeText ?? ((chunk: string) => process.stdout.write(chunk));
-  const stream = (chunk: string) => {
-    if (chunk) textOpen = true;
-    writeText(chunk);
-  };
-  const status = (line: string) => {
-    if (textOpen) {
-      writeText("\n");
-      textOpen = false;
-    }
-    log(line);
-  };
+  const stream = (chunk: string) => emit({ type: "text", chunk });
+  const notice = (level: "info" | "warn" | "error", text: string) =>
+    emit({ type: "notice", level, text });
 
   session.messages.push({ role: "user", content: [{ type: "text", text: userInput }] });
   tracer.emit("turn_start", { input: userInput });
@@ -362,11 +343,10 @@ export async function runTurn(
 
     // What replaced the cap: a long turn should be visible, not severed.
     if (progressEvery > 0 && iteration > 0 && iteration % progressEvery === 0) {
-      status(
-        palette.meta(
-          `⋯ still working — ${iteration} tool rounds, ` +
-            `context ${formatTokens(lastViewTokens)}/${formatTokens(budget.contextWindowTokens)} · Esc to stop`,
-        ),
+      notice(
+        "info",
+        `still working — ${iteration} tool rounds, ` +
+          `context ${formatTokens(lastViewTokens)}/${formatTokens(budget.contextWindowTokens)} · Esc to stop`,
       );
     }
 
@@ -380,16 +360,16 @@ export async function runTurn(
         view.suggestedCutIndex,
         view.tokens,
         deps,
-        status,
+        notice,
         tracer,
       );
       if (compacted) {
         view = buildSendView(session, budget);
-        status(`⋯ context now ${formatTokens(view.tokens)}/${formatTokens(budget.contextWindowTokens)}`);
+        notice("info", `context now ${formatTokens(view.tokens)}/${formatTokens(budget.contextWindowTokens)}`);
       }
     } else if (view.level === "omitted" && !announcedOmission) {
       tracer.emit("context_omitted", { tokens: view.tokens, budget: budget.historyTokens });
-      status("⋯ older tool output omitted from this request to stay within context");
+      notice("info", "older tool output omitted from this request to stay within context");
       announcedOmission = true;
     }
 
@@ -439,7 +419,7 @@ export async function runTurn(
     for (const toolUse of toolUses) {
       // The status line stays up for the whole turn (spec §16.10): clearing
       // it between tools makes the input box below it jump a row each time.
-      if (tools[toolUse.name]?.streamsOutput) status(callLine(toolUse, palette, "", width));
+      if (tools[toolUse.name]?.streamsOutput) emit({ type: "tool_start", toolUse });
       tracer.emit("tool_call", { id: toolUse.id, name: toolUse.name, input: toolUse.input });
 
       if (deps.approval.needsConfirmation(toolUse)) {
@@ -468,7 +448,7 @@ export async function runTurn(
         if (typeof target === "string") changedFiles.add(target);
       }
       results.push(
-        await executeToolUse(toolUse, tools, deps, status, tracer, options.signal, palette, width),
+        await executeToolUse(toolUse, tools, deps, emit, tracer, options.signal),
       );
     }
 
@@ -495,7 +475,7 @@ export async function runTurn(
           `[The user sent this while you were working. It is a new instruction — ` +
           `where it conflicts with your current plan, follow this instead.]\n${message}`,
       });
-      status(palette.meta(`↳ steering: ${message}`));
+      emit({ type: "steering", message });
       tracer.emit("steering", { message });
     }
     session.messages.push({ role: "user", content });
@@ -522,16 +502,13 @@ export async function runTurn(
       role: "user",
       content: [{ type: "text", text: "[The user interrupted this turn before it finished.]" }],
     });
-    status("⎋ interrupted");
+    notice("warn", "interrupted");
   } else if (outcome === "max_iterations") {
-    status(
-      palette.warn(
-        `⚠ hit the configured MAX_TOOL_ITERATIONS ceiling (${ceiling}) without finishing. ` +
-          `Send another message to continue.`,
-      ),
+    notice(
+      "warn",
+      `hit the configured MAX_TOOL_ITERATIONS ceiling (${ceiling}) without finishing. ` +
+        `Send another message to continue.`,
     );
-  } else if (textOpen) {
-    writeText("\n");
   }
 
   activity(null);

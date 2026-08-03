@@ -3,7 +3,7 @@
  * orchestrator — one subagent at a time, blocking, reusing `runTurn`
  * rather than a second loop implementation.
  */
-import { runTurn, type AgentDeps } from "../agent.js";
+import { summaryLineOf, runTurn, type AgentDeps } from "../agent.js";
 import type { Session } from "../session.js";
 import { BASE_TOOLS, type ToolRegistry } from "./index.js";
 import { ToolError, requireString, type Tool } from "./types.js";
@@ -95,21 +95,20 @@ export function createSpawnAgentTool(spawn: SpawnAgentDeps): Tool {
         messages: [],
       };
 
-      const prefixed = (line: string) => context.log(`  │ ${line}`);
       // Streamed text arrives as fragments; buffer to line boundaries so
       // the subagent's output stays visibly nested (spec §5.6).
-      let pending = "";
-      const writeText = (chunk: string) => {
-        pending += chunk;
-        const lines = pending.split("\n");
-        pending = lines.pop() ?? "";
-        for (const line of lines) prefixed(line);
-      };
-
       const result = await run(subSession, task, spawn.deps, {
         tools: toolsForRole(role),
-        log: prefixed,
-        writeText,
+        // Forwarded, not re-rendered: the parent's renderer decides how a
+        // nested turn looks (spec §17.6). Text events keep their own line
+        // buffering there, so only whole notices need the prefix here.
+        onEvent: (event) => {
+          if (event.type === "notice") {
+            context.log(`  │ ${event.text}`);
+          } else if (event.type === "tool_end") {
+            context.log(`  │ ${summaryLineOf(event.toolUse)}`);
+          }
+        },
         persist: () => {},
         // Same trace file, one level deeper: the subagent's steps are the
         // most interesting thing to visualize, and they never enter the
@@ -120,7 +119,6 @@ export function createSpawnAgentTool(spawn: SpawnAgentDeps): Tool {
         signal: context.signal,
       });
 
-      if (pending) prefixed(pending);
       context.tracer.emit("subagent_end", {
         role,
         outcome: result.outcome,

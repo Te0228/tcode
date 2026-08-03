@@ -90,7 +90,7 @@ function danglingToolUseIds(messages: Message[]): string[] {
 describe("scenario 1: no tool_use", () => {
   it("ends the turn without calling the LLM again", async () => {
     const { send, calls } = fakeSend([textResponse("just an answer")]);
-    const result = await runTurn(session(), "hi", deps(send), { log: () => {}, persist: noopPersist });
+    const result = await runTurn(session(), "hi", deps(send), {  persist: noopPersist });
 
     expect(result.outcome).toBe("no_tool_use");
     expect(result.lastText).toBe("just an answer");
@@ -107,7 +107,7 @@ describe("scenario 2: finish alone", () => {
 
     const result = await runTurn(s, "do it", deps(send), {
       tools: { finish: finishStub },
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -147,7 +147,7 @@ describe("scenario 3 (REGRESSION LOCK): finish mixed with other tool_uses", () =
 
     const result = await runTurn(s, "read then finish", deps(send), {
       tools,
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -177,14 +177,14 @@ describe("scenario 3 (REGRESSION LOCK): finish mixed with other tool_uses", () =
       ),
     ]);
     const s = session();
-    await runTurn(s, "first turn", deps(first.send), { tools, log: () => {}, persist: noopPersist });
+    await runTurn(s, "first turn", deps(first.send), { tools,  persist: noopPersist });
 
     // Simulate reloading the session and sending another message.
     const resumed: Session = { ...s, messages: structuredClone(s.messages) };
     const second = fakeSend([textResponse("second turn answer")]);
     await runTurn(resumed, "second turn", deps(second.send), {
       tools,
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -213,7 +213,7 @@ describe("scenario 4: tool throws", () => {
     ]);
     const s = session();
 
-    const result = await runTurn(s, "edit it", deps(send), { tools, log: () => {}, persist: noopPersist });
+    const result = await runTurn(s, "edit it", deps(send), { tools,  persist: noopPersist });
 
     expect(result.outcome).toBe("finished");
     expect(calls).toHaveLength(2);
@@ -248,7 +248,7 @@ describe("scenario 5: user declines confirmation", () => {
       deps(send, {
         approval: { needsConfirmation: (t) => t.name === "bash", confirm: async () => false },
       }),
-      { tools, log: () => {}, persist: noopPersist },
+      { tools,  persist: noopPersist },
     );
 
     expect(execute).not.toHaveBeenCalled();
@@ -274,7 +274,9 @@ describe("scenario 6: MAX_TOOL_ITERATIONS as an opt-in ceiling (spec §3)", () =
 
     const result = await runTurn(s, "loop forever", deps(send, {}, { maxToolIterations: 3 }), {
       tools,
-      log: (line) => logged.push(line),
+      onEvent: (event) => {
+        if (event.type === "notice") logged.push(event.text);
+      },
       persist: persisted,
     });
 
@@ -298,7 +300,7 @@ describe("scenario 6: MAX_TOOL_ITERATIONS as an opt-in ceiling (spec §3)", () =
 
     const result = await runTurn(s, "big migration", deps(send), {
       tools: { read_file: fakeTool("read_file", () => "contents"), finish: finishStub },
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -317,7 +319,9 @@ describe("scenario 6: MAX_TOOL_ITERATIONS as an opt-in ceiling (spec §3)", () =
 
     await runTurn(session(), "long task", deps(send, {}, { progressEveryIterations: 3 }), {
       tools: { read_file: fakeTool("read_file", () => "contents") },
-      log: (line) => logged.push(line),
+      onEvent: (event) => {
+        if (event.type === "notice") logged.push(event.text);
+      },
       persist: noopPersist,
     });
 
@@ -337,7 +341,9 @@ describe("scenario 6: MAX_TOOL_ITERATIONS as an opt-in ceiling (spec §3)", () =
 
     await runTurn(session(), "long task", deps(send, {}, { progressEveryIterations: 0 }), {
       tools: { read_file: fakeTool("read_file", () => "contents") },
-      log: (line) => logged.push(line),
+      onEvent: (event) => {
+        if (event.type === "notice") logged.push(event.text);
+      },
       persist: noopPersist,
     });
 
@@ -372,7 +378,7 @@ describe("scenario 7: multiple non-finish tools in one batch", () => {
     ]);
     const s = session();
 
-    await runTurn(s, "do three things", deps(send), { tools, log: () => {}, persist: noopPersist });
+    await runTurn(s, "do three things", deps(send), { tools,  persist: noopPersist });
 
     // Fully serial: no tool starts before the previous one ends.
     expect(order).toEqual([
@@ -401,7 +407,7 @@ describe("oversized tool_result", () => {
 
     await runTurn(s, "dump a lot", deps(send, {}, { maxOutputChars: 1000 }), {
       tools,
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -426,7 +432,7 @@ describe("context management: session stays intact", () => {
 
     await runTurn(s, "run three", deps(send, { contextWindowTokens: 8000 }), {
       tools,
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -451,7 +457,7 @@ describe("context management: session stays intact", () => {
   it("reports context usage back to the caller", async () => {
     const { send } = fakeSend([textResponse("hi")]);
     const result = await runTurn(session(), "hello", deps(send, { contextWindowTokens: 50_000 }), {
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -493,7 +499,7 @@ describe("context management: compaction", () => {
       s,
       "run several",
       deps(sendWithSummarizer, { contextWindowTokens: 12_000 }, { compactKeepRecent: 2 }),
-      { tools: bigHistoryTools(), log: () => {}, persist: noopPersist },
+      { tools: bigHistoryTools(),  persist: noopPersist },
     );
 
     expect(compactionCalls).toBeGreaterThan(0);
@@ -526,7 +532,7 @@ describe("context management: compaction", () => {
       s,
       "run several",
       deps(sendWithSummarizer, { contextWindowTokens: 10_000 }, { compactKeepRecent: 1 }),
-      { tools: bigHistoryTools(), log: () => {}, persist: noopPersist },
+      { tools: bigHistoryTools(),  persist: noopPersist },
     );
 
     for (const compaction of s.compactions ?? []) {
@@ -555,7 +561,9 @@ describe("context management: compaction", () => {
       s,
       "run several",
       deps(sendWithFailingSummarizer, { contextWindowTokens: 10_000 }, { compactKeepRecent: 1 }),
-      { tools: bigHistoryTools(), log: (line) => logged.push(line), persist: noopPersist },
+      { tools: bigHistoryTools(), onEvent: (event) => {
+        if (event.type === "notice") logged.push(event.text);
+      }, persist: noopPersist },
     );
 
     expect(result.outcome).toBe("no_tool_use");
@@ -591,7 +599,7 @@ describe("subagent approval", () => {
 
     await runTurn(session(), "delegate", deps(send), {
       tools: { spawn_agent: spawnTool },
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -630,7 +638,7 @@ describe("scenario 8: spawn_agent", () => {
 
     await runTurn(s, "delegate this", deps(mainSend.send), {
       tools: { spawn_agent: spawnTool },
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -676,7 +684,7 @@ describe("scenario 8: spawn_agent", () => {
 
     await runTurn(s, "delegate", deps(mainSend.send), {
       tools: { spawn_agent: spawnTool },
-      log: () => {},
+      
       persist: noopPersist,
     });
 
@@ -707,7 +715,7 @@ describe("interruption (spec §3.2)", () => {
 
     const result = await runTurn(s, "do things", deps(send), {
       tools,
-      log: () => {},
+      
       persist: noopPersist,
       signal: controller.signal,
     });
@@ -736,7 +744,7 @@ describe("interruption (spec §3.2)", () => {
 
     await runTurn(s, "two tools", deps(send), {
       tools,
-      log: () => {},
+      
       persist: noopPersist,
       signal: controller.signal,
     });
@@ -756,7 +764,7 @@ describe("interruption (spec §3.2)", () => {
     const s = session();
 
     await runTurn(s, "interrupted immediately", deps(send), {
-      log: () => {},
+      
       persist: persisted,
       signal: controller.signal,
     });
@@ -773,7 +781,7 @@ describe("interruption (spec §3.2)", () => {
     const { send } = fakeSend([textResponse("unused")]);
     const s = session();
 
-    await runTurn(s, "stop", deps(send), { log: () => {}, persist: noopPersist, signal: controller.signal });
+    await runTurn(s, "stop", deps(send), {  persist: noopPersist, signal: controller.signal });
 
     expect(JSON.stringify(s.messages.at(-1))).toMatch(/interrupted this turn/i);
   });
@@ -783,7 +791,7 @@ describe("interruption (spec §3.2)", () => {
     const { send } = fakeSend([textResponse("all good")]);
 
     const result = await runTurn(session(), "hi", deps(send), {
-      log: () => {},
+      
       persist: noopPersist,
       signal: controller.signal,
     });
@@ -805,7 +813,7 @@ describe("scenario 9: steering — input typed during the turn joins it (spec §
 
     const result = await runTurn(s, "go", deps(send), {
       tools: { echo, finish: finishStub },
-      log: () => {},
+      
       persist: noopPersist,
       drainInput: () => typed.splice(0),
     });
@@ -832,7 +840,7 @@ describe("scenario 9: steering — input typed during the turn joins it (spec §
 
     await runTurn(s, "go", deps(send), {
       tools: { echo },
-      log: () => {},
+      
       persist: noopPersist,
       drainInput: () => ["pivot to X"],
     });
@@ -853,7 +861,7 @@ describe("scenario 9: steering — input typed during the turn joins it (spec §
 
     const result = await runTurn(s, "go", deps(send), {
       tools: { finish: finishStub },
-      log: () => {},
+      
       persist: noopPersist,
       drainInput: () => typed.splice(0),
     });
@@ -877,7 +885,7 @@ describe("scenario 9: steering — input typed during the turn joins it (spec §
           return "done";
         }),
       },
-      log: () => {},
+      
       persist: noopPersist,
       signal: controller.signal,
       drainInput: () => typed.splice(0),
@@ -898,7 +906,7 @@ describe("scenario 9: steering — input typed during the turn joins it (spec §
 
     await runTurn(s, "go", deps(send), {
       tools: { echo },
-      log: () => {},
+      
       persist: noopPersist,
       drainInput: () => ["steer me"],
     });
@@ -910,7 +918,7 @@ describe("scenario 9: steering — input typed during the turn joins it (spec §
     const { send } = fakeSend([toolResponse(use("echo", "e1", {})), textResponse("ok")]);
     const s = session();
 
-    await runTurn(s, "go", deps(send), { tools: { echo }, log: () => {}, persist: noopPersist });
+    await runTurn(s, "go", deps(send), { tools: { echo },  persist: noopPersist });
 
     expect(s.messages[2].content.map((block) => block.type)).toEqual(["tool_result"]);
   });
