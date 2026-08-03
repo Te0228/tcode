@@ -205,3 +205,17 @@ describe("bash: interruption (spec §3.2)", () => {
     expect(output).toMatch(/interrupted/i);
   });
 });
+
+describe("finish: status is optional (spec §5.5)", () => {
+  it("defaults to done when the model sends only a summary", async () => {
+    // Regression lock: requiring it printed a red `"status" is required`
+    // underneath the green ✓ of a turn the loop had already accepted.
+    expect(await resultOf(finishTool, { summary: "did it" }, context)).toBe("[done] did it");
+  });
+
+  it("still rejects a status that is neither done nor blocked", async () => {
+    expect(() => finishTool.execute({ summary: "s", status: "maybe" }, context)).toThrow(
+      /done.*blocked/,
+    );
+  });
+});

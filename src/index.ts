@@ -6,11 +6,12 @@
  */
 import path from "node:path";
 import readline from "node:readline";
-import { runTurn, type AgentDeps } from "./agent.js";
+import { PassThrough } from "node:stream";
+import { compactNow, runTurn, type AgentDeps } from "./agent.js";
 import { createApprovalPolicy } from "./approval.js";
 import { loadConfig, loadEnvFiles, userConfigDir } from "./config.js";
 import { estimateTokens, formatTokens } from "./tokens.js";
-import { budgetWarning, computeBudget } from "./context.js";
+import { budgetWarning, buildSendView, computeBudget } from "./context.js";
 import { createSend, MissingApiKeyError, resolveProviderConfig } from "./llm/index.js";
 import { loadMemory } from "./memory.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -23,11 +24,20 @@ import {
   type Session,
 } from "./session.js";
 import { createToolRegistry } from "./tools/spawn_agent.js";
+import { COMMANDS, parseCommand, renderHelp, unknownCommand } from "./commands.js";
+import { HISTORY_MAX_ENTRIES, loadHistory, saveHistory } from "./history.js";
+import { expandMentions } from "./mentions.js";
+import { createCompleter } from "./ui/completer.js";
+import {
+  DISABLE_BRACKETED_PASTE,
+  ENABLE_BRACKETED_PASTE,
+  createPasteFilter,
+} from "./ui/paste.js";
 import { createMarkdownRenderer } from "./ui/format.js";
 import { isInterruptKey } from "./ui/keys.js";
 import { createLiveInput } from "./ui/live-input.js";
 import { createSpinner, SPINNER_INTERVAL_MS, type Activity } from "./ui/spinner.js";
-import { colorEnabled, createPalette } from "./ui/style.js";
+import { colorEnabled, createPalette, type Palette } from "./ui/style.js";
 import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
 import { startViewer } from "./viewer/server.js";
 
@@ -39,10 +49,19 @@ interface CliArgs {
   view?: { sessionId?: string };
   /** `tcode sessions`: print the list and exit (spec §4). */
   listSessions: boolean;
+  /** `--resume` with no id: pick from a list instead (spec §15.6). */
+  pickSession: boolean;
+  /** `-p <task>`: run one turn and exit (spec §15.6). */
+  print?: string;
 }
 
 export function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { continueLatest: false, fullAuto: false, listSessions: false };
+  const args: CliArgs = {
+    continueLatest: false,
+    fullAuto: false,
+    listSessions: false,
+    pickSession: false,
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -53,9 +72,16 @@ export function parseArgs(argv: string[]): CliArgs {
     } else if (arg === "--continue" || arg === "-c") {
       args.continueLatest = true;
     } else if (arg === "--resume") {
-      const id = argv[++i];
-      if (!id) throw new Error("--resume requires a session id");
-      args.resumeId = id;
+      // No id means "show me what there is" — the id is a timestamp plus a
+      // random suffix, so requiring it up front made the flag unusable
+      // without a separate lookup first (spec §15.6).
+      const next = argv[i + 1];
+      if (next && !next.startsWith("-")) args.resumeId = argv[++i];
+      else args.pickSession = true;
+    } else if (arg === "-p" || arg === "--print") {
+      const task = argv[++i];
+      if (!task) throw new Error("-p requires a task");
+      args.print = task;
     } else if (arg === "--full-auto") {
       args.fullAuto = true;
     } else if (arg === "--view") {
@@ -100,25 +126,34 @@ function formatWhen(iso: string): string {
 }
 
 /** `tcode sessions` (spec §4): newest first, then exit. */
-function runSessionList(root: string): void {
-  const sessions = listSessions(root);
-  if (sessions.length === 0) {
-    console.log(`no sessions yet in ${root}`);
-    return;
-  }
+function runSessionList(root: string, palette: Palette): void {
+  for (const line of sessionListLines(root, palette)) console.log(line);
+}
 
-  console.log(`${sessions.length} session${sessions.length === 1 ? "" : "s"} in ${root}\n`);
+/** Shared by `tcode sessions` and `/sessions` so the two can never drift. */
+function sessionListLines(root: string, palette: Palette, currentId?: string): string[] {
+  const sessions = listSessions(root);
+  if (sessions.length === 0) return [`no sessions yet in ${root}`];
+
+  const lines = [`${sessions.length} session${sessions.length === 1 ? "" : "s"} in ${root}`, ""];
   for (const [index, { session, firstInput, exchanges }] of sessions.entries()) {
-    // The newest is what `--continue` picks; say so rather than making the
-    // user infer it from the ordering.
-    const marker = index === 0 ? " ← --continue" : "";
-    console.log(`${formatWhen(session.updatedAt)}  ${session.id}${marker}`);
-    console.log(
-      `  ${exchanges} message${exchanges === 1 ? "" : "s"} · ${session.provider}/${session.model}` +
-        `${firstInput ? `\n  ${truncateForList(firstInput)}` : ""}\n`,
+    const marker =
+      session.id === currentId
+        ? palette.success(" ← current")
+        : index === 0
+          ? palette.meta(" ← --continue")
+          : "";
+    lines.push(`${formatWhen(session.updatedAt)}  ${session.id}${marker}`);
+    lines.push(
+      palette.meta(
+        `  ${exchanges} message${exchanges === 1 ? "" : "s"} · ${session.provider}/${session.model}`,
+      ),
     );
+    if (firstInput) lines.push(`  ${truncateForList(firstInput)}`);
+    lines.push("");
   }
-  console.log(`resume one with:  tcode --resume <id>`);
+  lines.push(palette.meta(`resume one with:  tcode --resume <id>   or   /resume`));
+  return lines;
 }
 
 /** First line only, and short: the list is an index, not a transcript. */
@@ -145,6 +180,8 @@ async function runViewer(root: string, sessionId?: string): Promise<void> {
 async function main(): Promise<void> {
   const root = path.resolve(process.cwd());
   loadEnvFiles(root);
+  const colorOptions = { isTTY: process.stdout.isTTY === true, env: process.env };
+  const palette = createPalette(colorOptions);
 
   let args: CliArgs;
   let providerConfig: ReturnType<typeof resolveProviderConfig>;
@@ -152,7 +189,7 @@ async function main(): Promise<void> {
   try {
     args = parseArgs(process.argv.slice(2));
     if (args.listSessions) {
-      runSessionList(root);
+      runSessionList(root, palette);
       return;
     }
     // A missing API key for the active provider fails here, before the
@@ -179,8 +216,6 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
-  const colorOptions = { isTTY: process.stdout.isTTY === true, env: process.env };
-  const palette = createPalette(colorOptions);
 
   // A session created under another provider still replays fine — the
   // history is normalized — so this is a notice, not an error (spec §4).
@@ -207,9 +242,46 @@ async function main(): Promise<void> {
     }
   }
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+
+  // Bracketed paste needs to see raw stdin before readline splits it into
+  // lines (spec §15.1), so readline reads from a stream we feed instead of
+  // from stdin directly. Piped input keeps the old wiring untouched: there
+  // is no terminal to negotiate with, and the simpler path is the one that
+  // has to keep working in CI.
+  const readlineInput = interactive ? new PassThrough() : process.stdin;
+  let onPaste: (text: string) => void = () => {};
+  if (interactive) {
+    const passthrough = readlineInput as PassThrough & {
+      isTTY?: boolean;
+      setRawMode?: (mode: boolean) => void;
+    };
+    passthrough.isTTY = true;
+    passthrough.setRawMode = (mode: boolean) => process.stdin.setRawMode(mode);
+
+    const filter = createPasteFilter({
+      onData: (chunk) => passthrough.write(chunk),
+      onPaste: (text) => onPaste(text),
+    });
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", filter);
+    process.stdout.write(ENABLE_BRACKETED_PASTE);
+    // Restore the terminal no matter how we leave, or every later paste in
+    // that shell spills raw `[200~` markers into whatever runs next.
+    process.on("exit", () => process.stdout.write(DISABLE_BRACKETED_PASTE));
+  }
+
+  const rl = readline.createInterface({
+    input: readlineInput,
+    output: process.stdout,
+    terminal: interactive ? true : undefined,
+    completer: interactive ? createCompleter(root) : undefined,
+    history: interactive ? loadHistory(root) : undefined,
+  });
 
   const PROMPT = `${palette.toolCall("›")} `;
+  /** Shown while a message spans more than one line (spec §15.2). */
+  const CONTINUATION_PROMPT = `${palette.meta("…")} `;
 
   // The input line stays on screen for the whole turn, with output
   // rendered above it (spec §3.2). Without this the prompt disappears the
@@ -220,7 +292,7 @@ async function main(): Promise<void> {
     columns: () => process.stdout.columns ?? 80,
     input: rl,
     prompt: PROMPT,
-    isTTY: process.stdout.isTTY === true && process.stdin.isTTY === true,
+    isTTY: interactive,
   });
 
   const spinner = createSpinner({ palette });
@@ -294,6 +366,26 @@ async function main(): Promise<void> {
       });
     });
 
+  /** `/resume` with no id, and `--resume` with no id (spec §15.6). */
+  const pickSession = async (target: string) => {
+    const sessions = listSessions(target);
+    if (sessions.length === 0) {
+      log("no sessions in this directory yet");
+      return undefined;
+    }
+    for (const [index, entry] of sessions.entries()) {
+      log(
+        `  ${String(index + 1).padStart(2)}. ${formatWhen(entry.session.updatedAt)} ` +
+          palette.meta(`${entry.exchanges} msgs `) +
+          truncateForList(entry.firstInput || entry.session.id),
+      );
+    }
+    const answer = await ask(`pick 1-${sessions.length} (Enter to cancel): `);
+    const choice = Number(answer?.trim());
+    if (!Number.isInteger(choice) || choice < 1 || choice > sessions.length) return undefined;
+    return sessions[choice - 1];
+  };
+
   const deps: AgentDeps = {
     send: createSend(providerConfig),
     approval: createApprovalPolicy({
@@ -347,6 +439,29 @@ async function main(): Promise<void> {
     memory.tokens,
   )) {
     console.log(line);
+  }
+
+  if (args.pickSession) {
+    const chosen = await pickSession(root);
+    if (chosen) session = chosen.session;
+    else console.log("keeping the new session");
+  }
+
+  // `-p` is a scripted, non-interactive run (spec §15.6): one turn, then
+  // exit. It prints the transcript plainly — no live frame, no spinner —
+  // because its output is meant to be piped somewhere.
+  if (args.print !== undefined) {
+    const expanded = expandMentions(args.print, root, config.maxOutputChars);
+    const result = await runTurn(session, expanded.text, deps, {
+      tools,
+      log: (line) => process.stdout.write(`${line}\n`),
+      writeText: (chunk) => process.stdout.write(chunk),
+      persist: saveSession,
+      tracer,
+    });
+    if (result.finish) process.stdout.write(`\n${result.finish.summary}\n`);
+    rl.close();
+    process.exit(result.outcome === "finished" || result.outcome === "no_tool_use" ? 0 : 1);
   }
 
   console.log(
@@ -418,9 +533,9 @@ async function main(): Promise<void> {
   // Ctrl+C stays as the fallback: some terminals swallow Esc, and Esc is
   // also the prefix of ANSI escape sequences, so arrow keys travel the
   // same path.
-  if (process.stdin.isTTY) {
-    readline.emitKeypressEvents(process.stdin, rl);
-    process.stdin.on("keypress", (_char, key) => {
+  if (interactive) {
+    readline.emitKeypressEvents(readlineInput, rl);
+    readlineInput.on("keypress", (_char, key) => {
       if (!isInterruptKey(key)) return;
       // Only meaningful while a turn is running; at the prompt, Esc is
       // part of ordinary line editing.
@@ -428,24 +543,189 @@ async function main(): Promise<void> {
     });
   }
 
+
+  /**
+   * Slash commands (spec §15.3). They talk to the CLI, so none of them ever
+   * enters `session.messages` — the model is not part of this exchange.
+   */
+  const runCommand = async (command: { name: string; args: string }): Promise<"ok" | "exit"> => {
+    switch (command.name) {
+      case "help":
+        for (const line of renderHelp(palette)) log(line);
+        return "ok";
+
+      case "exit":
+        return "exit";
+
+      case "model":
+        log(`${providerConfig.provider}/${providerConfig.model}`);
+        log(
+          palette.meta(
+            `  switch with PROVIDER=<name> when starting tcode; see ${path.join(userConfigDir(), ".env")}`,
+          ),
+        );
+        return "ok";
+
+      case "sessions": {
+        for (const line of sessionListLines(root, palette, session.id)) log(line);
+        return "ok";
+      }
+
+      case "new": {
+        session = createSession(root, providerConfig.provider, providerConfig.model);
+        log(palette.success(`✓ new session ${session.id}`));
+        return "ok";
+      }
+
+      case "resume": {
+        const target = command.args
+          ? listSessions(root).find((entry) => entry.session.id === command.args)
+          : await pickSession(root);
+        if (!target) {
+          if (command.args) log(palette.error(`no session with id ${command.args}`));
+          return "ok";
+        }
+        session = target.session;
+        log(
+          palette.success(`✓ resumed ${session.id}`) +
+            palette.meta(` · ${target.exchanges} messages`),
+        );
+        return "ok";
+      }
+
+      case "compact": {
+        live.start();
+        setActivity({ kind: "compacting" });
+        try {
+          if (await compactNow(session, deps, log, tracer)) saveSession(session);
+        } finally {
+          setActivity(null);
+          live.stop();
+        }
+        return "ok";
+      }
+
+      case "context": {
+        const systemPromptTokens = estimateTokens(deps.systemPrompt);
+        const inputs = {
+          contextWindowTokens: providerConfig.contextWindowTokens,
+          compactThreshold: config.compactThreshold,
+          reservedOutputTokens: config.reservedOutputTokens,
+          compactKeepRecent: config.compactKeepRecent,
+          systemPromptTokens,
+        };
+        const view = buildSendView(session, computeBudget(inputs));
+        log(palette.strong("context"));
+        for (const [label, value] of [
+          ["window", formatTokens(providerConfig.contextWindowTokens)],
+          ["system prompt", formatTokens(systemPromptTokens)],
+          ["  of which memory", formatTokens(memory.tokens)],
+          ["history (as sent)", formatTokens(view.tokens)],
+          ["reserved for reply", formatTokens(config.reservedOutputTokens)],
+          ["messages", `${session.messages.length}`],
+          ["detail level", view.level],
+          ["compactions", `${(session.compactions ?? []).length}`],
+        ] as [string, string][]) {
+          log(`  ${label.padEnd(18)} ${palette.meta(value)}`);
+        }
+        log("");
+        return "ok";
+      }
+
+      default:
+        for (const line of unknownCommand(command.name, palette)) log(line);
+        return "ok";
+    }
+  };
+
+  // A message can span several lines: `\` continues, and a bracketed paste
+  // arrives whole (spec §15.1/§15.2). `draft` holds the lines already
+  // committed to the current message.
+  let draft: string[] = [];
+
+  /** Prompt for the line being typed. A pasted or continued message is
+   * folded into the prompt rather than echoed above it: at the idle prompt
+   * readline owns that row, and printing into it lands on top of the `›`. */
+  const promptFor = () =>
+    draft.length === 0
+      ? PROMPT
+      : `${palette.meta(`[+${draft.length} line${draft.length === 1 ? "" : "s"}]`)} ${CONTINUATION_PROMPT}`;
+
+  const refreshPrompt = () => {
+    rl.setPrompt(promptFor());
+    rl.prompt(true);
+  };
+
+  onPaste = (text) => {
+    const lines = text.replace(/\r\n?/g, "\n").split("\n");
+    // The tail has no newline after it, so it is still being composed —
+    // it goes into the line buffer where it can be edited before sending.
+    const last = lines.pop() ?? "";
+    if (lines.length > 0) {
+      lines[0] = rl.line + lines[0];
+      rl.write(null as never, { ctrl: true, name: "e" });
+      rl.write(null as never, { ctrl: true, name: "u" });
+      draft.push(...lines);
+      refreshPrompt();
+    }
+    rl.write(last);
+  };
+
+  /** One complete user message: loops until a line neither ends with `\`
+   * nor leaves a draft open. */
+  const readMessage = async (): Promise<string | null> => {
+    for (;;) {
+      const answer = await ask(promptFor());
+      if (answer === null) return null;
+      if (answer.endsWith("\\")) {
+        draft.push(answer.slice(0, -1));
+        continue;
+      }
+      const message = [...draft, answer].join("\n").trim();
+      draft = [];
+      return message;
+    }
+  };
+
   while (true) {
     // A queued message runs without re-prompting; otherwise wait for input.
     let input = queued.shift();
     if (input === undefined) {
-      const answer = await ask(PROMPT);
+      const answer = await readMessage();
       if (answer === null) break;
-      input = answer.trim();
+      input = answer;
     } else {
       // Still inside the previous turn's frame, so this echo renders above
       // the input line like any other output.
       log(`${PROMPT}${palette.userInput(input)}`);
     }
-    if (!input || input === "exit" || input === "quit") break;
+    if (!input) break;
+
+    const command = parseCommand(input);
+    if (command) {
+      const outcome = await runCommand(command);
+      if (outcome === "exit") break;
+      continue;
+    }
+
+    // `@path` attaches files to the message the model receives; the
+    // terminal only shows one folded line each (spec §15.4).
+    const expanded = expandMentions(input, root, config.maxOutputChars);
+    for (const attachment of expanded.attachments) {
+      log(
+        palette.meta(
+          `  @${attachment.path} (${attachment.lines} lines${attachment.truncated ? ", truncated" : ""})`,
+        ),
+      );
+    }
+    for (const failure of expanded.failures) {
+      log(palette.error(`  @${failure.path} — ${failure.reason}`));
+    }
 
     controller = new AbortController();
     live.start();
     try {
-      const result = await runTurn(session, input, deps, {
+      const result = await runTurn(session, expanded.text, deps, {
         tools,
         log,
         writeText,
@@ -463,6 +743,16 @@ async function main(): Promise<void> {
         const blocked = result.finish.status === "blocked";
         const label = blocked ? palette.warn("⚠ blocked") : palette.success("✓ done");
         log(`\n${label}: ${result.finish.summary}`);
+      }
+      // What the user almost always does next is `git diff` or `git add`,
+      // and reconstructing the list from the scrollback is busywork (§15.6).
+      if (result.changedFiles.length > 0) {
+        log(
+          palette.meta(
+            `\n${result.changedFiles.length} file${result.changedFiles.length === 1 ? "" : "s"} changed: ` +
+              result.changedFiles.join(", "),
+          ),
+        );
       }
       // Context usage is never a surprise: show it every turn (spec §3.1).
       log(
@@ -484,6 +774,10 @@ async function main(): Promise<void> {
     }
   }
 
+  // `history` is real and documented as an option, but absent from the
+  // Interface type; readline maintains it on the instance.
+  const historyOf = (): string[] => (rl as unknown as { history?: string[] }).history ?? [];
+  if (interactive) saveHistory(root, historyOf(), HISTORY_MAX_ENTRIES);
   rl.close();
 }
 

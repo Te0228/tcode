@@ -78,6 +78,7 @@ function runTurn(session, userInput):
 
 要点:
 
+- **`finish` 的 `status` 是可选的,默认 `done`。** 实跑里模型经常只给 `summary`,于是工具抛错、终端上打出一行红色的 `"status" is required`,而循环仍然按"已完成"收尾——**工具拒绝了循环接受的东西**,用户看到的是绿色的 ✓ 底下压着一条红色报错,自相矛盾。省略 `status` 时唯一合理的解释就是 `done`(`finishPayloadOf` 本来就是这么兜底的),把它设成必填只是在制造这条矛盾。
 - **`finish` 是提示性的**,不是进程退出信号。模型调用 `finish(summary, status)` 表示"这轮任务我认为做完了",CLI 打印 summary 并结束当前 turn 的内部循环,但进程继续跑 REPL,等待用户下一条输入。
 - **消息历史必须闭合**:一次响应里可能同时出现 `finish` 和其他 tool_use(模型经常这么做,比如先读一下文件再收尾)。循环永远先把该批所有 tool_use 执行完、`tool_result` 全部回填,再判断要不要 break;不能因为看到 `finish` 就跳过其余工具的执行/结果回填,否则下次 `--continue` 会因为 assistant 消息里有未闭合的 tool_use 而直接报错。
 - **turn 的工具调用次数默认不设上限。**
@@ -403,10 +404,18 @@ src/
     style.ts          # 颜色能力检测 + 语义色板(见 14)。无色时退化成恒等函数,调用方不写 if
     format.ts         # 工具调用/结果摘要/diff/markdown 的行级渲染(见 14),纯函数,不碰 stdout
     spinner.ts        # 执行中的状态指示(见 14.4 P2)
+    paste.ts          # 括号粘贴(见 15.1):把原始 stdin 拆成"按键"和"整段粘贴"。
+                      # 必须在 readline 之前拿到数据,所以 readline 读的是一个由它喂的流
+    completer.ts      # Tab 路径补全(见 15.4),补全范围不越出项目目录
     live-input.ts     # 执行期间固定在最下方的输入行(见 3.2):输出写在它上方,半行也照样渲染。
                       # 输入行本身归 readline 画,这里只负责擦/重排 frame;非 TTY 时整体退化成直写 stdout
   context.ts          # buildSendView(session, budget):完整历史 → 发送视图。三级降级 + compaction 切分点选择。
                       # 纯函数,不改 session、不发请求;真正调 LLM 生成摘要的那一步由 agent.ts 触发后写回 session.compactions
+  commands.ts         # 斜杠命令的解析与帮助文本(见 15.3)。纯函数;分发留在 REPL,
+                      # 因为只有它握着 session 和 agent deps
+  history.ts          # 输入历史的读写(见 15.5):<project>/.tcode/history,按项目存
+  mentions.ts         # @path 展开(见 15.4):给模型的消息附上文件内容,给终端一行折叠摘要。
+                      # 引用即读取,同样受 6 节的目录范围限制
   prompt.ts           # buildSystemPrompt({ root, memory, fullAuto }):按 10 节要点拼 system prompt。
                       # 单独一个模块而不是塞进 index.ts——子 agent 也要用同一份(见 5.6),放展示层会导致两处拼装逻辑
   tools/

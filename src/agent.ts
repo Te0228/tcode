@@ -19,6 +19,7 @@ import {
   COMPACTION_SYSTEM_PROMPT,
   buildSendView,
   computeBudget,
+  findCutIndex,
   renderForSummary,
   type Budget,
 } from "./context.js";
@@ -85,6 +86,9 @@ export interface TurnResult {
   lastText: string;
   /** Context usage of the last request, for the REPL's status line. */
   usage: { tokens: number; contextWindowTokens: number };
+  /** Files this turn wrote, in the order first touched (spec §15.6). The
+   * user's next step is almost always `git diff` or `git add`. */
+  changedFiles: string[];
 }
 
 /** One-line "what the agent is doing now" summary (spec §3). */
@@ -226,6 +230,38 @@ async function executeToolUse(
   }
 }
 
+/**
+ * `/compact` (spec §15.3): the same summarization the loop performs at the
+ * threshold, on demand. Exported rather than duplicated so there is exactly
+ * one implementation of the cut-point rules from §3.1.
+ */
+export async function compactNow(
+  session: Session,
+  deps: AgentDeps,
+  log: (line: string) => void,
+  tracer: Tracer = NOOP_TRACER,
+): Promise<boolean> {
+  const budget = computeBudget({
+    contextWindowTokens: deps.contextWindowTokens,
+    compactThreshold: deps.config.compactThreshold,
+    reservedOutputTokens: deps.config.reservedOutputTokens,
+    compactKeepRecent: deps.config.compactKeepRecent,
+    systemPromptTokens: estimateTokens(deps.systemPrompt),
+  });
+  const view = buildSendView(session, budget);
+  // Below the threshold `buildSendView` proposes nothing, but an explicit
+  // `/compact` means the user wants it anyway — so fall back to the same
+  // keep-recent rule, still snapped to a legal cut point (spec §3.1).
+  const cutIndex =
+    view.suggestedCutIndex ??
+    findCutIndex(session.messages, session.messages.length - deps.config.compactKeepRecent);
+  if (cutIndex <= (session.compactions?.at(-1)?.upToIndex ?? 0)) {
+    log("nothing to compact yet — the history is still short");
+    return false;
+  }
+  return compact(session, cutIndex, view.tokens, deps, log, tracer);
+}
+
 export async function runTurn(
   session: Session,
   userInput: string,
@@ -273,6 +309,7 @@ export async function runTurn(
   let lastText = "";
   let lastViewTokens = 0;
   let announcedOmission = false;
+  const changedFiles = new Set<string>();
 
   // Unbounded by default (spec §3). The old hard cap severed legitimate
   // long tasks — a whole-project migration is dozens of rounds of real
@@ -390,6 +427,10 @@ export async function runTurn(
       }
 
       activity({ kind: "tool", label: summaryLineOf(toolUse).slice(0, 60) });
+      if (toolUse.name === "edit_file" || toolUse.name === "write_file") {
+        const target = (toolUse.input as Record<string, unknown> | null)?.path;
+        if (typeof target === "string") changedFiles.add(target);
+      }
       results.push(
         await executeToolUse(toolUse, tools, deps, log, tracer, options.signal, palette),
       );
@@ -472,5 +513,5 @@ export async function runTurn(
     ...(finish ? { finish } : {}),
   });
 
-  return { outcome, finish, lastText, usage };
+  return { outcome, finish, lastText, usage, changedFiles: [...changedFiles] };
 }

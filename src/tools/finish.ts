@@ -19,17 +19,25 @@ export const finishTool: Tool = {
       type: "object",
       properties: {
         summary: { type: "string", description: "What you did, or what you're blocked on." },
-        status: { type: "string", enum: ["done", "blocked"], description: "Turn outcome." },
+        status: {
+          type: "string",
+          enum: ["done", "blocked"],
+          description: "Turn outcome; defaults to 'done'.",
+        },
       },
-      required: ["summary", "status"],
+      required: ["summary"],
     },
   },
 
   execute(input) {
     const summary = requireString(input, "summary");
-    const status = requireString(input, "status");
+    // Optional by decision, not by laziness (spec §5.5): models routinely
+    // send only a summary, and rejecting that printed a red "status is
+    // required" underneath the green ✓ of a turn the loop had already
+    // accepted as finished.
+    const status = input.status ?? "done";
     if (status !== "done" && status !== "blocked") {
-      throw new ToolError(`status must be "done" or "blocked", got "${status}"`);
+      throw new ToolError(`status must be "done" or "blocked", got "${String(status)}"`);
     }
     return `[${status}] ${summary}`;
   },
