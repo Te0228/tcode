@@ -394,7 +394,6 @@ export async function runTurn(
       deps.systemPrompt,
       { onTextDelta: stream },
     );
-    activity(null);
 
     session.messages.push({ role: "assistant", content: response.content });
 
@@ -422,8 +421,9 @@ export async function runTurn(
     // writes in one batch can't race each other (spec §3).
     const results: ToolResultBlock[] = [];
     for (const toolUse of toolUses) {
+      // The status line stays up for the whole turn (spec §16.10): clearing
+      // it between tools makes the input box below it jump a row each time.
       if (tools[toolUse.name]?.streamsOutput) status(callLine(toolUse, palette, "", width));
-      else status("");
       tracer.emit("tool_call", { id: toolUse.id, name: toolUse.name, input: toolUse.input });
 
       if (deps.approval.needsConfirmation(toolUse)) {
@@ -454,7 +454,6 @@ export async function runTurn(
       results.push(
         await executeToolUse(toolUse, tools, deps, log, tracer, options.signal, palette, width),
       );
-      activity(null);
     }
 
     const finishUse = toolUses.find((toolUse) => toolUse.name === FINISH_TOOL_NAME);

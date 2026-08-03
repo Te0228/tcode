@@ -61,6 +61,15 @@ const cursorToColumn = (column: number) => `\u001b[${column + 1}G`;
 const cursorUp = (rows: number) => (rows > 0 ? `\u001b[${rows}A` : "");
 const CLEAR_BELOW = "\u001b[0J";
 
+/**
+ * Synchronized output (DEC private mode 2026, spec §16.10). A terminal that
+ * understands it buffers everything between the two and presents it in one
+ * frame; one that does not treats it as an unknown private mode and ignores
+ * it. Either way the update is never shown half-applied.
+ */
+const SYNC_START = "\u001b[?2026h";
+const SYNC_END = "\u001b[?2026l";
+
 export function createLiveScreen(options: LiveScreenOptions): LiveScreen {
   const { write: out, columns, renderInput, isTTY } = options;
 
@@ -76,16 +85,26 @@ export function createLiveScreen(options: LiveScreenOptions): LiveScreen {
   /** Where the cursor sits inside the input band, so the next erase knows
    * how far back up to travel. */
   let inputRow = 0;
+  /** The last frame drawn, so an update that changes nothing sends nothing
+   * (spec §16.10). */
+  let lastFrame = "";
 
-  const eraseFrame = () => {
-    out(`${cursorUp(inputRow + statusRows + pendingRows)}${cursorToColumn(0)}${CLEAR_BELOW}`);
-  };
+  const eraseFrame = () => cursorUp(inputRow + statusRows + pendingRows) + cursorToColumn(0) + CLEAR_BELOW;
 
-  const drawFrame = () => {
+  /**
+   * Builds the whole update as one string — cursor moves, erase and content
+   * together — so it can go out in a single write. Erasing and drawing as
+   * two writes lets the terminal render the moment in between, and that
+   * blank moment is the flicker (spec §16.10).
+   */
+  const buildFrame = (committed: string): { text: string; signature: string } => {
     const width = columns();
+    let text = "";
+
+    if (committed) text += committed;
 
     if (pending) {
-      out(`${pending}\n`);
+      text += `${pending}\n`;
       // Measure with the newline included: a line that exactly fills the
       // terminal wraps *and* takes the newline, and measuring the two
       // separately gets that case off by one.
@@ -95,7 +114,7 @@ export function createLiveScreen(options: LiveScreenOptions): LiveScreen {
     }
 
     if (statusText) {
-      out(`${statusText}\n`);
+      text += `${statusText}\n`;
       statusRows = displayPos(`${statusText}\n`, width).rows;
     } else {
       statusRows = 0;
@@ -104,13 +123,26 @@ export function createLiveScreen(options: LiveScreenOptions): LiveScreen {
     const region = renderInput();
     // Joined, not newline-terminated: the last row must not end with a
     // newline or the terminal scrolls and the cursor lands below the frame.
-    out(region.lines.join("\n"));
+    text += region.lines.join("\n");
 
     const lastRow = Math.max(0, region.lines.length - 1);
     const target = Math.max(0, Math.min(region.cursorRow, lastRow));
-    out(cursorUp(lastRow - target));
-    out(cursorToColumn(region.cursorCol));
+    text += cursorUp(lastRow - target) + cursorToColumn(region.cursorCol);
     inputRow = target;
+
+    return {
+      text,
+      signature: `${pending}\u0000${statusText}\u0000${region.lines.join("\u0000")}\u0000${target}:${region.cursorCol}`,
+    };
+  };
+
+  /** One write per update, wrapped in synchronized output. */
+  const paint = (committed: string) => {
+    const erase = eraseFrame();
+    const frame = buildFrame(committed);
+    if (!committed && frame.signature === lastFrame) return;
+    lastFrame = frame.signature;
+    out(`${SYNC_START}${erase}${frame.text}${SYNC_END}`);
   };
 
   return {
@@ -124,27 +156,26 @@ export function createLiveScreen(options: LiveScreenOptions): LiveScreen {
       statusText = "";
       statusRows = 0;
       inputRow = 0;
-      drawFrame();
+      lastFrame = "";
+      paint("");
     },
 
     stop() {
       if (!active) return;
-      eraseFrame();
-      if (pending) {
-        out(pending.endsWith("\n") ? pending : `${pending}\n`);
-        pending = "";
-      }
+      const tail = pending && !pending.endsWith("\n") ? `${pending}\n` : pending;
+      out(`${SYNC_START}${eraseFrame()}${tail}${SYNC_END}`);
+      pending = "";
       pendingRows = 0;
       statusText = "";
       statusRows = 0;
       inputRow = 0;
+      lastFrame = "";
       active = false;
     },
 
     refresh() {
       if (!isTTY || !active) return;
-      eraseFrame();
-      drawFrame();
+      paint("");
     },
 
     write(text) {
@@ -153,21 +184,20 @@ export function createLiveScreen(options: LiveScreenOptions): LiveScreen {
         out(text);
         return;
       }
-      eraseFrame();
       pending += text;
       const lastBreak = pending.lastIndexOf("\n");
+      let committed = "";
       if (lastBreak >= 0) {
-        out(pending.slice(0, lastBreak + 1));
+        committed = pending.slice(0, lastBreak + 1);
         pending = pending.slice(lastBreak + 1);
       }
-      drawFrame();
+      paint(committed);
     },
 
     setStatus(text) {
       if (!isTTY || !active || text === statusText) return;
-      eraseFrame();
       statusText = text;
-      drawFrame();
+      paint("");
     },
 
     rewritePending(text) {
@@ -176,9 +206,8 @@ export function createLiveScreen(options: LiveScreenOptions): LiveScreen {
         return;
       }
       if (text === pending) return;
-      eraseFrame();
       pending = text;
-      drawFrame();
+      paint("");
     },
   };
 }

@@ -10,6 +10,7 @@ import {
   shortenPath,
 } from "../../src/ui/chrome.js";
 import { createSelect } from "../../src/ui/select.js";
+import { createLiveScreen } from "../../src/ui/live-screen.js";
 import { BASIC_PALETTE, NO_COLOR_PALETTE, colorLevel } from "../../src/ui/theme.js";
 import { displayWidth } from "../../src/ui/width.js";
 
@@ -171,5 +172,94 @@ describe("colour level (spec §16.3)", () => {
     expect(colorLevel({ isTTY: true, env: { NO_COLOR: "1", COLORTERM: "truecolor" } })).toBe("none");
     expect(colorLevel({ isTTY: false, env: { COLORTERM: "truecolor" } })).toBe("none");
     expect(colorLevel({ isTTY: false, env: { FORCE_COLOR: "1" } })).not.toBe("none");
+  });
+});
+
+describe("live screen: flicker (spec §16.10)", () => {
+  const ESC = String.fromCharCode(27);
+  const SYNC_START = `${ESC}[?2026h`;
+  const SYNC_END = `${ESC}[?2026l`;
+
+  function harness(region: () => { lines: string[]; cursorRow: number; cursorCol: number }) {
+    const writes: string[] = [];
+    const screen = createLiveScreen({
+      write: (text) => writes.push(text),
+      columns: () => 80,
+      renderInput: region,
+      isTTY: true,
+    });
+    return { screen, writes };
+  }
+
+  const box3 = () => ({ lines: ["top", "content", "bottom"], cursorRow: 1, cursorCol: 4 });
+
+  it("sends each update as a single write", () => {
+    // Erasing and drawing as two writes lets the terminal render the blank
+    // moment in between, and that blank moment is the flicker.
+    const { screen, writes } = harness(box3);
+    screen.start();
+    writes.length = 0;
+    screen.write("a line\n");
+    expect(writes).toHaveLength(1);
+  });
+
+  it("wraps every update in synchronized output", () => {
+    const { screen, writes } = harness(box3);
+    screen.start();
+    screen.write("a line\n");
+    for (const update of writes) {
+      expect(update.startsWith(SYNC_START)).toBe(true);
+      expect(update.endsWith(SYNC_END)).toBe(true);
+    }
+  });
+
+  it("keeps the erase inside the same update as the redraw", () => {
+    const { screen, writes } = harness(box3);
+    screen.start();
+    writes.length = 0;
+    screen.refresh();
+    // Nothing changed, so nothing should be sent at all.
+    expect(writes).toEqual([]);
+  });
+
+  it("sends nothing when the frame is identical", () => {
+    let line = "content";
+    const { screen, writes } = harness(() => ({
+      lines: ["top", line, "bottom"],
+      cursorRow: 1,
+      cursorCol: 4,
+    }));
+    screen.start();
+    writes.length = 0;
+
+    screen.refresh();
+    expect(writes).toEqual([]);
+
+    line = "changed";
+    screen.refresh();
+    expect(writes).toHaveLength(1);
+  });
+
+  it("still redraws when only the status line ticks", () => {
+    const { screen, writes } = harness(box3);
+    screen.start();
+    writes.length = 0;
+    screen.setStatus("spin 1");
+    screen.setStatus("spin 2");
+    expect(writes).toHaveLength(2);
+  });
+
+  it("emits nothing at all without a terminal", () => {
+    const writes: string[] = [];
+    const screen = createLiveScreen({
+      write: (text) => writes.push(text),
+      columns: () => 80,
+      renderInput: box3,
+      isTTY: false,
+    });
+    screen.start();
+    screen.setStatus("spin");
+    screen.write("plain\n");
+    expect(writes.join("")).toBe("plain\n");
   });
 });
