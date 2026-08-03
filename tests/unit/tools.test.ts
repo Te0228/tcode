@@ -9,7 +9,22 @@ import { bashTool } from "../../src/tools/bash.js";
 import { finishTool } from "../../src/tools/finish.js";
 import { readFileTool } from "../../src/tools/read_file.js";
 import { writeFileTool } from "../../src/tools/write_file.js";
-import { truncateOutput, type ToolContext } from "../../src/tools/types.js";
+import {
+  normalizeToolReturn,
+  truncateOutput,
+  type Tool,
+  type ToolContext,
+} from "../../src/tools/types.js";
+
+/** Tools now return either a bare string or a {result, display} pair
+ * (spec §14.4 P0); these tests are about the model-facing half. */
+async function resultOf(
+  tool: Tool,
+  input: Record<string, unknown>,
+  ctx: ToolContext,
+): Promise<string> {
+  return normalizeToolReturn(await tool.execute(input, ctx)).result;
+}
 
 let root: string;
 let context: ToolContext;
@@ -26,7 +41,7 @@ afterEach(() => {
 describe("read_file", () => {
   it("returns content with line numbers", async () => {
     fs.writeFileSync(path.join(root, "a.txt"), "first\nsecond\n");
-    const output = await readFileTool.execute({ path: "a.txt" }, context);
+    const output = await resultOf(readFileTool, { path: "a.txt" }, context);
     expect(output).toContain("1\tfirst");
     expect(output).toContain("2\tsecond");
   });
@@ -34,7 +49,7 @@ describe("read_file", () => {
   it("honors offset and limit for paging through a large file", async () => {
     fs.writeFileSync(path.join(root, "big.txt"), Array.from({ length: 100 }, (_, i) => `line${i + 1}`).join("\n"));
 
-    const output = await readFileTool.execute({ path: "big.txt", offset: 50, limit: 2 }, context);
+    const output = await resultOf(readFileTool, { path: "big.txt", offset: 50, limit: 2 }, context);
 
     expect(output).toContain("50\tline50");
     expect(output).toContain("51\tline51");
@@ -66,7 +81,7 @@ describe("write_file", () => {
 
   it("overwrites an existing file wholesale", async () => {
     fs.writeFileSync(path.join(root, "a.txt"), "old content");
-    const output = await writeFileTool.execute({ path: "a.txt", content: "new" }, context);
+    const output = await resultOf(writeFileTool, { path: "a.txt", content: "new" }, context);
 
     expect(fs.readFileSync(path.join(root, "a.txt"), "utf8")).toBe("new");
     expect(output).toMatch(/overwrote/);
@@ -75,20 +90,20 @@ describe("write_file", () => {
 
 describe("bash", () => {
   it("reports stdout and a zero exit code", async () => {
-    const output = await bashTool.execute({ command: "echo hi" }, context);
+    const output = await resultOf(bashTool, { command: "echo hi" }, context);
     expect(output).toContain("exit code: 0");
     expect(output).toContain("hi");
   });
 
   it("reports a non-zero exit code and stderr rather than throwing", async () => {
-    const output = await bashTool.execute({ command: "echo oops >&2; exit 3" }, context);
+    const output = await resultOf(bashTool, { command: "echo oops >&2; exit 3" }, context);
     expect(output).toContain("exit code: 3");
     expect(output).toContain("oops");
   });
 
   it("runs in the project root", async () => {
     fs.writeFileSync(path.join(root, "marker.txt"), "");
-    const output = await bashTool.execute({ command: "ls" }, context);
+    const output = await resultOf(bashTool, { command: "ls" }, context);
     expect(output).toContain("marker.txt");
   });
 
@@ -113,7 +128,7 @@ describe("bash", () => {
 
 describe("finish", () => {
   it.each(["done", "blocked"] as const)("passes status %s through", async (status) => {
-    const output = await finishTool.execute({ summary: "s", status }, context);
+    const output = await resultOf(finishTool, { summary: "s", status }, context);
     expect(output).toBe(`[${status}] s`);
   });
 
@@ -146,8 +161,7 @@ describe("bash: interruption (spec §3.2)", () => {
     const started = Date.now();
     setTimeout(() => controller.abort(), 200);
 
-    const output = await bashTool.execute(
-      { command: "sleep 10" },
+    const output = await resultOf(bashTool, { command: "sleep 10" },
       { ...context, signal: controller.signal },
     );
 
@@ -160,8 +174,7 @@ describe("bash: interruption (spec §3.2)", () => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 600);
 
-    const output = await bashTool.execute(
-      { command: "echo early-output; sleep 10" },
+    const output = await resultOf(bashTool, { command: "echo early-output; sleep 10" },
       { ...context, signal: controller.signal },
     );
 
@@ -171,8 +184,7 @@ describe("bash: interruption (spec §3.2)", () => {
 
   it("is unaffected by a signal that never fires", async () => {
     const controller = new AbortController();
-    const output = await bashTool.execute(
-      { command: "echo done" },
+    const output = await resultOf(bashTool, { command: "echo done" },
       { ...context, signal: controller.signal },
     );
 
@@ -185,8 +197,7 @@ describe("bash: interruption (spec §3.2)", () => {
     controller.abort();
     const started = Date.now();
 
-    const output = await bashTool.execute(
-      { command: "sleep 10" },
+    const output = await resultOf(bashTool, { command: "sleep 10" },
       { ...context, signal: controller.signal },
     );
 

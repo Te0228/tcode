@@ -1,9 +1,11 @@
 import { executor } from "../executor.js";
+import { outputLines } from "../ui/format.js";
 import {
   ToolError,
   optionalNumber,
   requireString,
   truncateOutput,
+  type DisplayLine,
   type Tool,
 } from "./types.js";
 
@@ -44,10 +46,12 @@ export const bashTool: Tool = {
     if (result.interrupted) {
       // Not an error: the user asked for this, and the output collected so
       // far is still worth keeping (spec §3.2).
-      return (
-        `[interrupted by user]\n` +
-        formatStreams(result.stdout, result.stderr, context.config.maxOutputChars)
-      );
+      return {
+        result:
+          `[interrupted by user]\n` +
+          formatStreams(result.stdout, result.stderr, context.config.maxOutputChars),
+        display: outputLines(result.stdout),
+      };
     }
 
     if (result.timedOut) {
@@ -58,7 +62,19 @@ export const bashTool: Tool = {
     }
 
     const streams = formatStreams(result.stdout, result.stderr, context.config.maxOutputChars);
-    return `exit code: ${result.exitCode}\n${streams}`;
+    const failed = result.exitCode !== 0;
+
+    // What the user sees on failure is the exit code and stderr — the
+    // reason. On success it is stdout, the thing they asked for. Before
+    // this, both cases showed nothing and looked identical (spec §14.1).
+    const display: DisplayLine[] = failed
+      ? [
+          { text: `exit ${result.exitCode}`, tone: "error" },
+          ...outputLines(result.stderr || result.stdout, "error"),
+        ]
+      : outputLines(result.stdout);
+
+    return { result: `exit code: ${result.exitCode}\n${streams}`, display, failed };
   },
 };
 

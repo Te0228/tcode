@@ -23,8 +23,11 @@ import {
   type Session,
 } from "./session.js";
 import { createToolRegistry } from "./tools/spawn_agent.js";
+import { createMarkdownRenderer } from "./ui/format.js";
 import { isInterruptKey } from "./ui/keys.js";
 import { createLiveInput } from "./ui/live-input.js";
+import { createSpinner, SPINNER_INTERVAL_MS, type Activity } from "./ui/spinner.js";
+import { colorEnabled, createPalette } from "./ui/style.js";
 import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
 import { startViewer } from "./viewer/server.js";
 
@@ -176,6 +179,8 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
+  const colorOptions = { isTTY: process.stdout.isTTY === true, env: process.env };
+  const palette = createPalette(colorOptions);
 
   // A session created under another provider still replays fine — the
   // history is normalized — so this is a notice, not an error (spec §4).
@@ -204,7 +209,7 @@ async function main(): Promise<void> {
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-  const PROMPT = "› ";
+  const PROMPT = `${palette.toolCall("›")} `;
 
   // The input line stays on screen for the whole turn, with output
   // rendered above it (spec §3.2). Without this the prompt disappears the
@@ -218,8 +223,51 @@ async function main(): Promise<void> {
     isTTY: process.stdout.isTTY === true && process.stdin.isTTY === true,
   });
 
+  const spinner = createSpinner({ palette });
+  let spinnerTimer: NodeJS.Timeout | undefined;
+  const setActivity = (activity: Activity | null) => {
+    spinner.set(activity);
+    if (activity === null) {
+      clearInterval(spinnerTimer);
+      spinnerTimer = undefined;
+      live.setStatus("");
+      return;
+    }
+    live.setStatus(spinner.tick());
+    if (spinnerTimer) return;
+    // `unref` so a stray timer can never hold the process open at exit.
+    spinnerTimer = setInterval(() => live.setStatus(spinner.tick()), SPINNER_INTERVAL_MS);
+    spinnerTimer.unref();
+  };
+
   const write = (text: string) => live.write(text);
   const log = (line: string) => write(line.endsWith("\n") ? line : `${line}\n`);
+
+  // Assistant text, rendered a line at a time (spec §14.4 P3). Half a line
+  // still streams out immediately — §3.2 wins on that — and is swapped for
+  // the rendered version once its newline arrives.
+  //
+  // Only when colour is on. With it off, rendering would strip the `**` and
+  // backticks and put nothing in their place, quietly editing the model's
+  // words on the way into a pipe.
+  const markdown = createMarkdownRenderer(palette);
+  let textBuffer = "";
+  const writeText = colorEnabled(colorOptions)
+    ? (chunk: string) => {
+        textBuffer += chunk;
+        let breakAt = textBuffer.indexOf("\n");
+        while (breakAt >= 0) {
+          const line = textBuffer.slice(0, breakAt);
+          textBuffer = textBuffer.slice(breakAt + 1);
+          live.rewritePending("");
+          log(markdown.render(line));
+          breakAt = textBuffer.indexOf("\n");
+        }
+        // Pending always mirrors the buffer, so the two can never disagree
+        // about what is already on screen.
+        live.rewritePending(textBuffer);
+      }
+    : write;
 
   // Ctrl+D / piped-stdin EOF closes readline; resolve to null so callers
   // stop instead of questioning a closed interface (spec §2).
@@ -301,8 +349,10 @@ async function main(): Promise<void> {
     console.log(line);
   }
 
-  console.log(`tcode · ${providerConfig.provider}/${providerConfig.model} · ${root}`);
-  console.log(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`);
+  console.log(
+    `${palette.strong("tcode")} · ${providerConfig.provider}/${providerConfig.model} · ${root}`,
+  );
+  console.log(palette.meta(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`));
 
   // Starting fresh on top of existing history is the one case worth a nudge
   // (spec §4). Resuming works fine; nobody could tell it was there, so every
@@ -311,15 +361,19 @@ async function main(): Promise<void> {
     const previous = listSessions(root).find((entry) => entry.session.id !== session.id);
     if (previous) {
       console.log(
-        `\n${previous.exchanges} message${previous.exchanges === 1 ? "" : "s"} of history here ` +
-          `from ${formatWhen(previous.session.updatedAt)} — this session starts empty.\n` +
-          `  tcode --continue   resume it        tcode sessions   list all`,
+        palette.meta(
+          `\n${previous.exchanges} message${previous.exchanges === 1 ? "" : "s"} of history here ` +
+            `from ${formatWhen(previous.session.updatedAt)} — this session starts empty.\n` +
+            `  tcode --continue   resume it        tcode sessions   list all`,
+        ),
       );
     }
   }
   console.log(
-    `type any time — a message sent during a turn joins that turn\n` +
-      `Esc or Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`,
+    palette.meta(
+      `type any time — a message sent during a turn joins that turn\n` +
+        `Esc or Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`,
+    ),
   );
 
   // Input typed while a turn is running is queued for the next one, and
@@ -337,7 +391,7 @@ async function main(): Promise<void> {
     queued.push(text);
     // "next step", not "after this turn": it joins the running turn as soon
     // as the current batch of tools finishes (spec §3.2).
-    log(`⏎ queued (${queued.length}) — joins this turn at the next step`);
+    log(palette.meta(`⏎ queued (${queued.length}) — joins this turn at the next step`));
   });
 
   const onInterrupt = () => {
@@ -345,7 +399,7 @@ async function main(): Promise<void> {
     // fire for one Ctrl+C, and `aborted` makes the second call a no-op.
     if (controller && !controller.signal.aborted) {
       controller.abort();
-      log(`\n⎋ interrupted — stopping the running command (press again to quit)`);
+      log(palette.warn(`\n⎋ interrupted — stopping the running command (press again to quit)`));
       return;
     }
     log("");
@@ -384,7 +438,7 @@ async function main(): Promise<void> {
     } else {
       // Still inside the previous turn's frame, so this echo renders above
       // the input line like any other output.
-      log(`${PROMPT}${input}`);
+      log(`${PROMPT}${palette.userInput(input)}`);
     }
     if (!input || input === "exit" || input === "quit") break;
 
@@ -394,7 +448,9 @@ async function main(): Promise<void> {
       const result = await runTurn(session, input, deps, {
         tools,
         log,
-        writeText: write,
+        writeText,
+        palette,
+        onActivity: setActivity,
         persist: saveSession,
         tracer,
         signal: controller.signal,
@@ -404,12 +460,15 @@ async function main(): Promise<void> {
         drainInput: () => queued.splice(0),
       });
       if (result.finish) {
-        const label = result.finish.status === "blocked" ? "⚠ blocked" : "✓ done";
+        const blocked = result.finish.status === "blocked";
+        const label = blocked ? palette.warn("⚠ blocked") : palette.success("✓ done");
         log(`\n${label}: ${result.finish.summary}`);
       }
       // Context usage is never a surprise: show it every turn (spec §3.1).
       log(
-        `\n[context ${formatTokens(result.usage.tokens)}/${formatTokens(result.usage.contextWindowTokens)}]\n`,
+        palette.meta(
+          `\n[context ${formatTokens(result.usage.tokens)}/${formatTokens(result.usage.contextWindowTokens)}]`,
+        ) + "\n",
       );
     } catch (error) {
       // Keep the REPL alive on an API/network failure — the session is
@@ -418,7 +477,7 @@ async function main(): Promise<void> {
       tracer.emit("error", { message });
       // Through `log`, not console.error: the input line is still drawn,
       // and a raw write would land inside it.
-      log(`\nturn failed: ${message}\n`);
+      log(palette.error(`\nturn failed: ${message}`) + "\n");
       saveSession(session);
     } finally {
       controller = null;

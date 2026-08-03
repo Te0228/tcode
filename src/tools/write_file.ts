@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveInRoot } from "../security.js";
+import { diffLines, diffStat } from "../ui/format.js";
 import { requireString, type Tool } from "./types.js";
 
 export const writeFileTool: Tool = {
@@ -24,10 +25,15 @@ export const writeFileTool: Tool = {
     const content = requireString(input, "content");
     const resolved = resolveInRoot(context.root, inputPath);
     const existed = fs.existsSync(resolved);
+    const before = existed ? fs.readFileSync(resolved, "utf8") : "";
 
     fs.mkdirSync(path.dirname(resolved), { recursive: true });
     fs.writeFileSync(resolved, content);
 
-    return `${existed ? "overwrote" : "created"} ${inputPath} (${content.length} chars)`;
+    const verb = existed ? "overwrote" : "created";
+    return {
+      result: `${verb} ${inputPath} (${content.length} chars) ${diffStat(before, content)}`,
+      display: diffLines(before, content),
+    };
   },
 };

@@ -27,7 +27,10 @@ import { estimateTokens, formatTokens } from "./tokens.js";
 import { NOOP_TRACER, type Tracer } from "./trace.js";
 import { FINISH_TOOL_NAME, finishPayloadOf, type FinishPayload } from "./tools/finish.js";
 import { BASE_TOOLS, type ToolRegistry } from "./tools/index.js";
-import { truncateOutput } from "./tools/types.js";
+import { normalizeToolReturn, truncateOutput } from "./tools/types.js";
+import { formatToolCall, formatToolResult, outputLines } from "./ui/format.js";
+import { NO_COLOR_PALETTE, type Palette } from "./ui/style.js";
+import type { Activity } from "./ui/spinner.js";
 
 export interface AgentDeps {
   send: SendFn;
@@ -58,6 +61,12 @@ export interface RunTurnOptions {
   /** Cooperative interruption (spec §3.2). Aborting stops the loop from
    * issuing further LLM calls; it never abandons an in-flight tool batch. */
   signal?: AbortSignal;
+  /** What the agent is doing right now, for the spinner (spec §14.4 P2).
+   * The REPL owns the timer; the loop only reports transitions. */
+  onActivity?: (activity: Activity | null) => void;
+  /** Semantic colours (spec §14). Defaults to no colour, so a caller that
+   * has not decided — tests, subagents — never emits escape sequences. */
+  palette?: Palette;
   /** Steering (spec §3.2): hands over anything the user typed while this
    * turn was running, to be folded into it rather than held for the next
    * one. Called once per iteration, at the only point where the history is
@@ -160,6 +169,7 @@ async function executeToolUse(
   log: (line: string) => void,
   tracer: Tracer,
   signal: AbortSignal | undefined,
+  palette: Palette,
 ): Promise<ToolResultBlock> {
   const tool = tools[toolUse.name];
   if (!tool) {
@@ -176,18 +186,26 @@ async function executeToolUse(
   const startedAt = Date.now();
   try {
     const input = (toolUse.input ?? {}) as Record<string, unknown>;
-    const output = await tool.execute(input, {
-      root: deps.root,
-      config: deps.config,
-      log,
-      tracer,
-      signal,
-    });
-    const content = truncateOutput(output, deps.config.maxOutputChars);
+    const outcome = normalizeToolReturn(
+      await tool.execute(input, {
+        root: deps.root,
+        config: deps.config,
+        log,
+        tracer,
+        signal,
+      }),
+    );
+    const content = truncateOutput(outcome.result, deps.config.maxOutputChars);
+
+    // Two separate paths on purpose (spec §14.4 P0): the model gets the
+    // full result, the user gets a summary capped at a few lines. Neither
+    // truncation touches the other.
+    for (const line of formatToolResult(outcome.display ?? [], palette)) log(line);
+
     tracer.emit("tool_result", {
       id: toolUse.id,
       name: toolUse.name,
-      ok: true,
+      ok: !outcome.failed,
       durationMs: Date.now() - startedAt,
       content,
     });
@@ -196,6 +214,7 @@ async function executeToolUse(
     // Tool failures are fed back to the model as is_error so it can retry
     // or change approach — they never crash the turn (spec §3).
     const content = truncateOutput(errorMessageOf(error), deps.config.maxOutputChars);
+    for (const line of formatToolResult(outputLines(content, "error"), palette)) log(line);
     tracer.emit("tool_result", {
       id: toolUse.id,
       name: toolUse.name,
@@ -217,6 +236,8 @@ export async function runTurn(
   const log = options.log ?? ((line: string) => console.log(line));
   const persist = options.persist ?? saveSession;
   const tracer = options.tracer ?? NOOP_TRACER;
+  const palette = options.palette ?? NO_COLOR_PALETTE;
+  const activity = options.onActivity ?? (() => {});
   const turnStartedAt = Date.now();
 
   // Streamed text has no trailing newline of its own; remember whether we
@@ -270,8 +291,10 @@ export async function runTurn(
     // What replaced the cap: a long turn should be visible, not severed.
     if (progressEvery > 0 && iteration > 0 && iteration % progressEvery === 0) {
       status(
-        `⋯ still working — ${iteration} tool rounds, ` +
-          `context ${formatTokens(lastViewTokens)}/${formatTokens(budget.contextWindowTokens)} · Esc to stop`,
+        palette.meta(
+          `⋯ still working — ${iteration} tool rounds, ` +
+            `context ${formatTokens(lastViewTokens)}/${formatTokens(budget.contextWindowTokens)} · Esc to stop`,
+        ),
       );
     }
 
@@ -308,12 +331,14 @@ export async function runTurn(
     });
     const requestStartedAt = Date.now();
 
+    activity({ kind: "model" });
     const response = await deps.send(
       view.messages,
       Object.values(tools).map((tool) => tool.schema),
       deps.systemPrompt,
       { onTextDelta: stream },
     );
+    activity(null);
 
     session.messages.push({ role: "assistant", content: response.content });
 
@@ -341,7 +366,7 @@ export async function runTurn(
     // writes in one batch can't race each other (spec §3).
     const results: ToolResultBlock[] = [];
     for (const toolUse of toolUses) {
-      status(summaryLineOf(toolUse));
+      status(formatToolCall(summaryLineOf(toolUse), palette));
       tracer.emit("tool_call", { id: toolUse.id, name: toolUse.name, input: toolUse.input });
 
       if (deps.approval.needsConfirmation(toolUse)) {
@@ -364,7 +389,11 @@ export async function runTurn(
         }
       }
 
-      results.push(await executeToolUse(toolUse, tools, deps, log, tracer, options.signal));
+      activity({ kind: "tool", label: summaryLineOf(toolUse).slice(0, 60) });
+      results.push(
+        await executeToolUse(toolUse, tools, deps, log, tracer, options.signal, palette),
+      );
+      activity(null);
     }
 
     const finishUse = toolUses.find((toolUse) => toolUse.name === FINISH_TOOL_NAME);
@@ -390,7 +419,7 @@ export async function runTurn(
           `[The user sent this while you were working. It is a new instruction — ` +
           `where it conflicts with your current plan, follow this instead.]\n${message}`,
       });
-      status(`↳ steering: ${message}`);
+      status(palette.meta(`↳ steering: ${message}`));
       tracer.emit("steering", { message });
     }
     session.messages.push({ role: "user", content });
@@ -420,12 +449,16 @@ export async function runTurn(
     status("⎋ interrupted");
   } else if (outcome === "max_iterations") {
     status(
-      `⚠ hit the configured MAX_TOOL_ITERATIONS ceiling (${ceiling}) without finishing. ` +
-        `Send another message to continue.`,
+      palette.warn(
+        `⚠ hit the configured MAX_TOOL_ITERATIONS ceiling (${ceiling}) without finishing. ` +
+          `Send another message to continue.`,
+      ),
     );
   } else if (textOpen) {
     writeText("\n");
   }
+
+  activity(null);
 
   // session.messages is saved complete and untrimmed — the only thing
   // context management writes back is the compaction cache (spec §3.1).

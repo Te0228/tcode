@@ -242,3 +242,69 @@ describe("displayWidth / displayPos", () => {
     expect(displayPos("0123456789a\n", 10)).toEqual({ rows: 2, cols: 0 });
   });
 });
+
+describe("live input: the spinner line (spec §14.4 P2)", () => {
+  it("sits between the output and the input, never inside either", () => {
+    const { live, output } = harness();
+    live.start();
+    live.write("running\n");
+    live.setStatus("⠋ thinking");
+    expect(render(output())).toEqual(["running", "⠋ thinking", "›"]);
+  });
+
+  it("replaces itself on each tick instead of stacking up", () => {
+    const { live, output } = harness();
+    live.start();
+    live.setStatus("⠋ thinking");
+    live.setStatus("⠙ thinking 1s");
+    live.setStatus("⠹ thinking 2s");
+    expect(render(output())).toEqual(["⠹ thinking 2s", "›"]);
+  });
+
+  it("erases correctly with a pending half-line above it", () => {
+    const { live, output } = harness();
+    live.start();
+    live.write("half a line");
+    live.setStatus("⠋ thinking");
+    live.write(" finished\n");
+    expect(render(output())).toEqual(["half a line finished", "⠋ thinking", "›"]);
+  });
+
+  it("never survives into the scrollback", () => {
+    // A turn ticks the spinner hundreds of times; committing any of them
+    // would bury the transcript the user scrolls back through.
+    const { live, output } = harness();
+    live.start();
+    live.setStatus("⠋ thinking");
+    live.stop();
+    expect(render(output())).toEqual(["›"]);
+  });
+
+  it("is inert without a terminal", () => {
+    const { live, chunks } = harness({ isTTY: false });
+    live.start();
+    live.setStatus("⠋ thinking");
+    live.write("out\n");
+    expect(chunks.join("")).toBe("out\n");
+  });
+});
+
+describe("live input: rewriting the pending line (spec §14.4 P3)", () => {
+  it("swaps a raw fragment for its rendered form", () => {
+    const { live, output } = harness();
+    live.start();
+    live.rewritePending("a **bold**");
+    live.rewritePending("");
+    live.write("a bold\n");
+    expect(render(output())).toEqual(["a bold", "›"]);
+  });
+
+  it("is a no-op when the text is unchanged, so idle ticks cost nothing", () => {
+    const { live, chunks } = harness();
+    live.start();
+    live.rewritePending("same");
+    chunks.length = 0;
+    live.rewritePending("same");
+    expect(chunks).toEqual([]);
+  });
+});

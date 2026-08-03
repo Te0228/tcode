@@ -59,6 +59,13 @@ export interface LiveInput {
   /** Enter was pressed mid-turn: readline committed its block and moved
    * below it, so the frame we were tracking no longer exists. */
   commitLine(): void;
+  /** Transient line between output and input — the spinner (spec §14.4 P2).
+   * Empty string removes it. Redraws immediately, so a timer can drive it. */
+  setStatus(text: string): void;
+  /** Replaces the not-yet-committed output line. Markdown needs this: the
+   * raw fragment is shown as it streams, then swapped for the rendered
+   * line once its newline arrives (spec §14.4 P3). */
+  rewritePending(text: string): void;
   isActive(): boolean;
 }
 
@@ -75,10 +82,14 @@ export function createLiveInput(options: LiveInputOptions): LiveInput {
   let pending = "";
   /** Rows the pending region occupied last time it was drawn. */
   let pendingRows = 0;
+  /** Spinner line, redrawn every frame and never committed to scrollback —
+   * a turn would otherwise leave hundreds of dead spinner rows behind. */
+  let statusText = "";
+  let statusRows = 0;
 
   /** Move to the top-left of the frame and wipe everything below it. */
   const eraseFrame = () => {
-    const up = input.getCursorPos().rows + pendingRows;
+    const up = input.getCursorPos().rows + pendingRows + statusRows;
     out(`${cursorUp(up)}${cursorToColumn(0)}${CLEAR_BELOW}`);
   };
 
@@ -93,6 +104,13 @@ export function createLiveInput(options: LiveInputOptions): LiveInput {
       pendingRows = displayPos(`${pending}\n`, width).rows;
     } else {
       pendingRows = 0;
+    }
+
+    if (statusText) {
+      out(`${statusText}\n`);
+      statusRows = displayPos(`${statusText}\n`, width).rows;
+    } else {
+      statusRows = 0;
     }
 
     const full = prompt + input.line;
@@ -116,6 +134,8 @@ export function createLiveInput(options: LiveInputOptions): LiveInput {
       active = true;
       pending = "";
       pendingRows = 0;
+      statusText = "";
+      statusRows = 0;
       input.setPrompt(prompt);
       drawFrame();
     },
@@ -128,6 +148,10 @@ export function createLiveInput(options: LiveInputOptions): LiveInput {
         pending = "";
       }
       pendingRows = 0;
+      // The spinner is transient by definition: it must not survive into
+      // the scrollback the user scrolls back through.
+      statusText = "";
+      statusRows = 0;
       // Redraw the input block before letting go. readline erases its own
       // block by moving up from where it believes the cursor is; leaving
       // that block missing would make its next redraw eat a row of real
@@ -156,6 +180,24 @@ export function createLiveInput(options: LiveInputOptions): LiveInput {
       drawFrame();
     },
 
+    setStatus(text) {
+      if (!isTTY || !active || text === statusText) return;
+      eraseFrame();
+      statusText = text;
+      drawFrame();
+    },
+
+    rewritePending(text) {
+      if (!active) {
+        out(text);
+        return;
+      }
+      if (text === pending) return;
+      eraseFrame();
+      pending = text;
+      drawFrame();
+    },
+
     commitLine() {
       if (!active) return;
       // readline echoed the input block and moved below it, stranding the
@@ -165,6 +207,7 @@ export function createLiveInput(options: LiveInputOptions): LiveInput {
       // is a line break where they pressed Enter.
       pending = "";
       pendingRows = 0;
+      statusRows = 0;
     },
   };
 }

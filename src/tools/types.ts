@@ -21,9 +21,53 @@ export interface ToolContext {
   signal?: AbortSignal;
 }
 
+/**
+ * A line a tool wants shown to the user (spec §14.4 P0).
+ *
+ * `tone` is semantic, not a colour: tools must not know what red means, or
+ * whether colour is on at all. `ui/format.ts` maps tone to style.
+ */
+export interface DisplayLine {
+  text: string;
+  tone?: "plain" | "added" | "removed" | "error" | "muted";
+}
+
+/**
+ * What a tool returns when the terminal and the model need different
+ * things (spec §14.4 P0).
+ *
+ * The two are deliberately separate paths. The model gets the full,
+ * untruncated `result`; the user gets `display`, which is allowed to be a
+ * diff, a line count, or the first few lines of a build log. Truncating one
+ * must never affect the other — the old shape had a single string, so
+ * everything shown to the user was also everything sent to the model, and
+ * the way out was to show nothing at all.
+ */
+export interface ToolOutcome {
+  /** Content of the `tool_result` — what the model sees. */
+  result: string;
+  /** What to print under the tool call. Omitted means "nothing to show":
+   * the call line alone already said it. */
+  display?: DisplayLine[];
+  /** The tool completed but the thing it ran failed (a non-zero exit).
+   * Not the same as throwing, which is the tool itself failing. */
+  failed?: boolean;
+}
+
+export type ToolReturn = string | ToolOutcome;
+
 export interface Tool {
   schema: ToolDefinition;
-  execute(input: Record<string, unknown>, context: ToolContext): Promise<string> | string;
+  execute(
+    input: Record<string, unknown>,
+    context: ToolContext,
+  ): Promise<ToolReturn> | ToolReturn;
+}
+
+/** A bare string still means "this is both the result and nothing to
+ * show" — the common case for tools whose call line says it all. */
+export function normalizeToolReturn(value: ToolReturn): ToolOutcome {
+  return typeof value === "string" ? { result: value } : value;
 }
 
 /** Thrown for expected, model-correctable failures (bad args, no match). */

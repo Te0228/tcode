@@ -66,6 +66,18 @@ export const readFileTool: Tool = {
       ? `${body}\n\n[showing lines ${startLine}-${start + selected.length} of ${allLines.length}]`
       : body;
 
-    return truncateOutput(truncated, context.config.maxOutputChars);
+    // Only the shape, never the contents: the model needs the file, the
+    // user is the one who asked for it to be read and does not want it
+    // echoed back at them (spec §14.4 P0).
+    return {
+      result: truncateOutput(truncated, context.config.maxOutputChars),
+      display: [
+        {
+          text: `${selected.length} line${selected.length === 1 ? "" : "s"}` +
+            (selected.length < allLines.length ? ` of ${allLines.length}` : ""),
+          tone: "muted",
+        },
+      ],
+    };
   },
 };

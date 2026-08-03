@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { resolveInRoot } from "../security.js";
+import { diffLines, diffStat } from "../ui/format.js";
 import { ToolError, requireString, type Tool } from "./types.js";
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -51,7 +52,10 @@ export const editFileTool: Tool = {
       }
       fs.mkdirSync(path.dirname(resolved), { recursive: true });
       fs.writeFileSync(resolved, newString);
-      return `created ${inputPath} (${newString.length} chars)`;
+      return {
+        result: `created ${inputPath} (${newString.length} chars)`,
+        display: diffLines("", newString),
+      };
     }
 
     if (!exists) {
@@ -78,8 +82,12 @@ export const editFileTool: Tool = {
       : content.replace(oldString, newString);
     fs.writeFileSync(resolved, updated);
 
-    return matches > 1
-      ? `edited ${inputPath} (${matches} occurrences replaced)`
-      : `edited ${inputPath}`;
+    // The file is already changed by the time this prints, so showing what
+    // changed is the only way the user can check the work (spec §14.1).
+    const suffix = matches > 1 ? ` (${matches} occurrences replaced)` : "";
+    return {
+      result: `edited ${inputPath}${suffix} ${diffStat(content, updated)}`,
+      display: diffLines(content, updated),
+    };
   },
 };
