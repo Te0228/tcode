@@ -35,9 +35,12 @@ import {
 } from "./ui/paste.js";
 import { createMarkdownRenderer } from "./ui/format.js";
 import { isInterruptKey } from "./ui/keys.js";
-import { createLiveInput } from "./ui/live-input.js";
+import { createLiveScreen, type InputRegion } from "./ui/live-screen.js";
+import { createEditor, type Key } from "./ui/editor.js";
+import { createSelect } from "./ui/select.js";
+import { banner, boxWidth, statusBar } from "./ui/chrome.js";
 import { createSpinner, SPINNER_INTERVAL_MS, type Activity } from "./ui/spinner.js";
-import { colorEnabled, createPalette, type Palette } from "./ui/style.js";
+import { colorEnabled, createPalette, type Palette } from "./ui/theme.js";
 import { NOOP_TRACER, createFileTracer, tracingEnabled } from "./trace.js";
 import { startViewer } from "./viewer/server.js";
 
@@ -156,6 +159,18 @@ function sessionListLines(root: string, palette: Palette, currentId?: string): s
   return lines;
 }
 
+/** Completion candidates across the width of the terminal, so twenty
+ * matches cost two rows instead of twenty. */
+function chunkCandidates(items: string[], columns: number): string[] {
+  const width = Math.max(...items.map((item) => item.length)) + 2;
+  const perRow = Math.max(1, Math.floor((columns - 2) / width));
+  const rows: string[] = [];
+  for (let at = 0; at < items.length; at += perRow) {
+    rows.push(`  ${items.slice(at, at + perRow).map((item) => item.padEnd(width)).join("")}`);
+  }
+  return rows;
+}
+
 /** First line only, and short: the list is an index, not a transcript. */
 function truncateForList(text: string): string {
   const line = text.split("\n")[0];
@@ -263,35 +278,60 @@ async function main(): Promise<void> {
       onData: (chunk) => passthrough.write(chunk),
       onPaste: (text) => onPaste(text),
     });
+    // Raw mode used to come free with `readline.createInterface`. Owning
+    // input means owning this too: without it the terminal echoes every
+    // keystroke itself and buffers until Enter, so the editor's rendering
+    // and the terminal's echo both write to the same rows.
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", filter);
     process.stdout.write(ENABLE_BRACKETED_PASTE);
     // Restore the terminal no matter how we leave, or every later paste in
     // that shell spills raw `[200~` markers into whatever runs next.
-    process.on("exit", () => process.stdout.write(DISABLE_BRACKETED_PASTE));
+    process.on("exit", () => {
+      process.stdout.write(DISABLE_BRACKETED_PASTE);
+      // Leaving the terminal in raw mode makes the user's shell unusable
+      // afterwards — no echo, no line editing, no Ctrl+C.
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    });
   }
 
-  const rl = readline.createInterface({
-    input: readlineInput,
-    output: process.stdout,
-    terminal: interactive ? true : undefined,
-    completer: interactive ? createCompleter(root) : undefined,
+  // `|| 80`, not `?? 80`: a terminal that has not reported its size yet
+  // gives 0, and 0 would be taken as a real (absurdly narrow) width — the
+  // first frame renders unboxed, the next one boxed, and the erase
+  // arithmetic between them is off by the rows the box added.
+  const columns = () => process.stdout.columns || 80;
+
+  // Input is ours now (spec §16.1): buffer, cursor, history, completion and
+  // the prompt loop. readline's key *parser* stays — it turns bytes into
+  // `{name, ctrl, meta}` and owns nothing — but its Interface is gone, and
+  // with it the cursor handoff, the `prevRows` bookkeeping and the need to
+  // route paste around it.
+  const editor = createEditor({
+    palette,
+    columns,
+    complete: interactive ? createCompleter(root) : undefined,
     history: interactive ? loadHistory(root) : undefined,
+    status: () => ({
+      left: `${providerConfig.model} · ${formatTokens(contextTokens)}/${formatTokens(providerConfig.contextWindowTokens)}`,
+      hints: turnRunning ? ["esc stop", "⏎ queue"] : ["⏎ send", "/help"],
+    }),
   });
 
-  const PROMPT = `${palette.toolCall("›")} `;
-  /** Shown while a message spans more than one line (spec §15.2). */
-  const CONTINUATION_PROMPT = `${palette.meta("…")} `;
+  /** Whatever currently owns the keyboard: the editor, or an overlay such
+   * as the approval dialog. One key entry point, never two — two parallel
+   * input paths is what produced the paste data loss in §15.1. */
+  let overlay: { handleKey(char: string | undefined, key: Key): unknown; render(): InputRegion } | null =
+    null;
 
-  // The input line stays on screen for the whole turn, with output
-  // rendered above it (spec §3.2). Without this the prompt disappears the
-  // moment work starts and typed characters land inside the streamed
-  // output — input that is accepted but invisible reads as no input at all.
-  const live = createLiveInput({
+  let contextTokens = 0;
+  let turnRunning = false;
+
+  const live = createLiveScreen({
     write: (text) => process.stdout.write(text),
-    columns: () => process.stdout.columns ?? 80,
-    input: rl,
-    prompt: PROMPT,
+    columns,
+    renderInput: () => (overlay ? overlay.render() : editor.render()),
     isTTY: interactive,
   });
 
@@ -341,49 +381,129 @@ async function main(): Promise<void> {
       }
     : write;
 
-  // Ctrl+D / piped-stdin EOF closes readline; resolve to null so callers
-  // stop instead of questioning a closed interface (spec §2).
   let closed = false;
-  rl.on("close", () => {
-    closed = true;
-  });
 
-  // Always hands the terminal back first: readline is about to redraw its
-  // own block, and it does that by moving up from where it last left the
-  // cursor. Leaving a frame of ours in the way makes it erase real output.
-  const ask = (question: string): Promise<string | null> =>
+  /** Resolves the pending `readMessage()`; null while a turn is running,
+   * in which case a submitted line is queued for steering instead. */
+  let awaitingMessage: ((text: string | null) => void) | null = null;
+
+  const quit = () => {
+    if (closed) return;
+    closed = true;
+    awaitingMessage?.(null);
+    awaitingMessage = null;
+  };
+
+  const deliver = (text: string) => {
+    if (!text) {
+      // An empty submit at the prompt is how you leave (spec §2).
+      if (awaitingMessage) quit();
+      return;
+    }
+    if (awaitingMessage) {
+      const resolve = awaitingMessage;
+      awaitingMessage = null;
+      log(`${palette.accent("›")} ${palette.userInput(text)}`);
+      resolve(text);
+      return;
+    }
+    queued.push(text);
+    log(`${palette.accent("›")} ${palette.userInput(text)}`);
+    log(palette.meta(`  queued (${queued.length}) — joins this turn at the next step`));
+  };
+
+  const readMessage = (): Promise<string | null> =>
     new Promise((resolve) => {
-      live.stop();
       if (closed) {
         resolve(null);
         return;
       }
-      const onClose = () => resolve(null);
-      rl.once("close", onClose);
-      rl.question(question, (answer) => {
-        rl.off("close", onClose);
-        resolve(answer);
-      });
+      awaitingMessage = resolve;
+      live.refresh();
     });
 
-  /** `/resume` with no id, and `--resume` with no id (spec §15.6). */
+  /** One keyboard entry point, dispatched by whoever currently owns input
+   * (spec §16.7). Two parallel paths is what produced the §15.1 data loss. */
+  const onKey = (char: string | undefined, key: Key) => {
+    if (overlay) {
+      overlay.handleKey(char, key);
+      live.refresh();
+      return;
+    }
+
+    const action = editor.handleKey(char, key);
+    switch (action.type) {
+      case "submit":
+        deliver(action.text);
+        break;
+      case "interrupt":
+        onInterrupt();
+        break;
+      case "eof":
+        quit();
+        break;
+      case "candidates":
+        for (const group of chunkCandidates(action.items, columns())) log(palette.meta(group));
+        break;
+    }
+    live.refresh();
+  };
+
+  /**
+   * A choice overlay (spec §16.6). Resolves on a single keypress — no
+   * letter to type, no Enter to confirm unless the user wants the
+   * highlighted option.
+   */
+  const choose = <T,>(config: {
+    title: string;
+    subject?: string;
+    detail?: string;
+    options: { label: string; value: T; shortcut?: string }[];
+    cancelValue: T;
+  }): Promise<T> =>
+    new Promise((resolve) => {
+      if (!interactive) {
+        resolve(config.cancelValue);
+        return;
+      }
+      const select = createSelect({ ...config, palette, columns });
+      overlay = {
+        handleKey: (char, key) => {
+          const action = select.handleKey(char, key);
+          if (action.type === "chosen") {
+            overlay = null;
+            resolve(action.value);
+          }
+          return action;
+        },
+        render: () => select.render(),
+      };
+      live.refresh();
+    });
+
+  /** `/resume` with no id, and `--resume` with no id (spec §15.6). Same
+   * overlay as the approval dialog: picking from a list should not require
+   * typing a number either. */
   const pickSession = async (target: string) => {
     const sessions = listSessions(target);
     if (sessions.length === 0) {
       log("no sessions in this directory yet");
       return undefined;
     }
-    for (const [index, entry] of sessions.entries()) {
-      log(
-        `  ${String(index + 1).padStart(2)}. ${formatWhen(entry.session.updatedAt)} ` +
-          palette.meta(`${entry.exchanges} msgs `) +
-          truncateForList(entry.firstInput || entry.session.id),
-      );
-    }
-    const answer = await ask(`pick 1-${sessions.length} (Enter to cancel): `);
-    const choice = Number(answer?.trim());
-    if (!Number.isInteger(choice) || choice < 1 || choice > sessions.length) return undefined;
-    return sessions[choice - 1];
+    const chosen = await choose<number>({
+      title: "resume which session?",
+      options: [
+        ...sessions.slice(0, 9).map((entry, at) => ({
+          label: `${formatWhen(entry.session.updatedAt)}  ${entry.exchanges} msgs  ${truncateForList(
+            entry.firstInput || entry.session.id,
+          )}`,
+          value: at,
+        })),
+        { label: "cancel", value: -1 },
+      ],
+      cancelValue: -1,
+    });
+    return chosen >= 0 ? sessions[chosen] : undefined;
   };
 
   const deps: AgentDeps = {
@@ -394,13 +514,19 @@ async function main(): Promise<void> {
       // Reuse the REPL's interface: a second readline on the same stdin
       // swallows the answer and hangs. EOF counts as a decline — never
       // run an unconfirmed command because input ran out.
-      prompt: async (question) => {
-        const answer = await ask(question);
-        // The turn continues after the answer, so the input line goes back
-        // up — `ask` took it down.
-        live.start();
-        return answer ?? "n";
-      },
+      // A single keypress, not a typed letter plus Enter (spec §16.6).
+      ask: async ({ command, reason }: { command: string; reason: string }) =>
+        choose<"yes" | "always" | "no">({
+          title: "run this command?",
+          subject: `$ ${command}`,
+          detail: reason,
+          options: [
+            { label: "yes", value: "yes", shortcut: "y" },
+            { label: "yes, and don't ask again this session", value: "always", shortcut: "a" },
+            { label: "no", value: "no", shortcut: "n" },
+          ],
+          cancelValue: "no",
+        }),
     }),
     config,
     root,
@@ -460,14 +586,22 @@ async function main(): Promise<void> {
       tracer,
     });
     if (result.finish) process.stdout.write(`\n${result.finish.summary}\n`);
-    rl.close();
-    process.exit(result.outcome === "finished" || result.outcome === "no_tool_use" ? 0 : 1);
+      process.exit(result.outcome === "finished" || result.outcome === "no_tool_use" ? 0 : 1);
   }
 
-  console.log(
-    `${palette.strong("tcode")} · ${providerConfig.provider}/${providerConfig.model} · ${root}`,
-  );
-  console.log(palette.meta(`session ${session.id}${args.fullAuto ? " · --full-auto" : ""}`));
+  for (const line of banner(
+    {
+      model: `${providerConfig.provider}/${providerConfig.model}`,
+      root,
+      session: session.id,
+      fullAuto: args.fullAuto,
+    },
+    boxWidth(columns()),
+    palette,
+  )) {
+    console.log(line);
+  }
+  console.log("");
 
   // Starting fresh on top of existing history is the one case worth a nudge
   // (spec §4). Resuming works fine; nobody could tell it was there, so every
@@ -484,30 +618,16 @@ async function main(): Promise<void> {
       );
     }
   }
-  console.log(
-    palette.meta(
-      `type any time — a message sent during a turn joins that turn\n` +
-        `Esc or Ctrl+C interrupts a running turn · empty line, "exit" or Ctrl+D quits\n`,
-    ),
-  );
+  // Hints live in the status bar now; repeating them here would be noise.
+  // The input box is drawn for the whole session, not just during a turn:
+  // it is the thing the user looks at, and a prompt that appears and
+  // disappears is what made the old REPL read as unfinished (spec §16.2).
+  live.start();
 
   // Input typed while a turn is running is queued for the next one, and
   // Ctrl+C interrupts that turn rather than killing the process (spec §3.2).
   const queued: string[] = [];
   let controller: AbortController | null = null;
-
-  rl.on("line", (line) => {
-    if (!controller) return; // Idle: `ask()` owns this line.
-    // readline has already echoed the line and moved past it, so the frame
-    // we were tracking is gone — tell the renderer before writing anything.
-    live.commitLine();
-    const text = line.trim();
-    if (!text) return;
-    queued.push(text);
-    // "next step", not "after this turn": it joins the running turn as soon
-    // as the current batch of tools finishes (spec §3.2).
-    log(palette.meta(`⏎ queued (${queued.length}) — joins this turn at the next step`));
-  });
 
   const onInterrupt = () => {
     // Idempotent: readline (TTY) and the process handler (pipes) can both
@@ -518,15 +638,13 @@ async function main(): Promise<void> {
       return;
     }
     log("");
-    rl.close();
-    process.exit(0);
+    quit();
   };
 
   // readline only emits SIGINT when stdin is a TTY. Without the process
   // handler, a piped stdin falls through to the default action — the
   // process dies mid-turn and the whole turn is lost, which is the exact
   // data loss this feature exists to prevent (spec §3.2).
-  rl.on("SIGINT", onInterrupt);
   process.on("SIGINT", onInterrupt);
 
   // Esc is the de-facto interrupt key for this class of tool (spec §3.2).
@@ -534,13 +652,9 @@ async function main(): Promise<void> {
   // also the prefix of ANSI escape sequences, so arrow keys travel the
   // same path.
   if (interactive) {
-    readline.emitKeypressEvents(readlineInput, rl);
-    readlineInput.on("keypress", (_char, key) => {
-      if (!isInterruptKey(key)) return;
-      // Only meaningful while a turn is running; at the prompt, Esc is
-      // part of ordinary line editing.
-      if (controller && !controller.signal.aborted) onInterrupt();
-    });
+    // The parser only — it turns bytes into named keys and owns nothing.
+    readline.emitKeypressEvents(readlineInput);
+    readlineInput.on("keypress", onKey);
   }
 
 
@@ -594,13 +708,11 @@ async function main(): Promise<void> {
       }
 
       case "compact": {
-        live.start();
         setActivity({ kind: "compacting" });
         try {
           if (await compactNow(session, deps, log, tracer)) saveSession(session);
         } finally {
           setActivity(null);
-          live.stop();
         }
         return "ok";
       }
@@ -643,48 +755,9 @@ async function main(): Promise<void> {
   // committed to the current message.
   let draft: string[] = [];
 
-  /** Prompt for the line being typed. A pasted or continued message is
-   * folded into the prompt rather than echoed above it: at the idle prompt
-   * readline owns that row, and printing into it lands on top of the `›`. */
-  const promptFor = () =>
-    draft.length === 0
-      ? PROMPT
-      : `${palette.meta(`[+${draft.length} line${draft.length === 1 ? "" : "s"}]`)} ${CONTINUATION_PROMPT}`;
-
-  const refreshPrompt = () => {
-    rl.setPrompt(promptFor());
-    rl.prompt(true);
-  };
-
   onPaste = (text) => {
-    const lines = text.replace(/\r\n?/g, "\n").split("\n");
-    // The tail has no newline after it, so it is still being composed —
-    // it goes into the line buffer where it can be edited before sending.
-    const last = lines.pop() ?? "";
-    if (lines.length > 0) {
-      lines[0] = rl.line + lines[0];
-      rl.write(null as never, { ctrl: true, name: "e" });
-      rl.write(null as never, { ctrl: true, name: "u" });
-      draft.push(...lines);
-      refreshPrompt();
-    }
-    rl.write(last);
-  };
-
-  /** One complete user message: loops until a line neither ends with `\`
-   * nor leaves a draft open. */
-  const readMessage = async (): Promise<string | null> => {
-    for (;;) {
-      const answer = await ask(promptFor());
-      if (answer === null) return null;
-      if (answer.endsWith("\\")) {
-        draft.push(answer.slice(0, -1));
-        continue;
-      }
-      const message = [...draft, answer].join("\n").trim();
-      draft = [];
-      return message;
-    }
+    editor.paste(text);
+    live.refresh();
   };
 
   while (true) {
@@ -697,7 +770,7 @@ async function main(): Promise<void> {
     } else {
       // Still inside the previous turn's frame, so this echo renders above
       // the input line like any other output.
-      log(`${PROMPT}${palette.userInput(input)}`);
+      log(`${palette.accent("›")} ${palette.userInput(input)}`);
     }
     if (!input) break;
 
@@ -723,7 +796,7 @@ async function main(): Promise<void> {
     }
 
     controller = new AbortController();
-    live.start();
+    turnRunning = true;
     try {
       const result = await runTurn(session, expanded.text, deps, {
         tools,
@@ -754,12 +827,10 @@ async function main(): Promise<void> {
           ),
         );
       }
-      // Context usage is never a surprise: show it every turn (spec §3.1).
-      log(
-        palette.meta(
-          `\n[context ${formatTokens(result.usage.tokens)}/${formatTokens(result.usage.contextWindowTokens)}]`,
-        ) + "\n",
-      );
+      // The status bar carries context usage permanently now (spec §16.2);
+      // announcing it again every turn would be repeating what is on screen.
+      contextTokens = result.usage.tokens;
+      log("");
     } catch (error) {
       // Keep the REPL alive on an API/network failure — the session is
       // still on disk and the user can retry.
@@ -771,14 +842,13 @@ async function main(): Promise<void> {
       saveSession(session);
     } finally {
       controller = null;
+      turnRunning = false;
+      live.refresh();
     }
   }
 
-  // `history` is real and documented as an option, but absent from the
-  // Interface type; readline maintains it on the instance.
-  const historyOf = (): string[] => (rl as unknown as { history?: string[] }).history ?? [];
-  if (interactive) saveHistory(root, historyOf(), HISTORY_MAX_ENTRIES);
-  rl.close();
+  live.stop();
+  if (interactive) saveHistory(root, editor.snapshotHistory(), HISTORY_MAX_ENTRIES);
 }
 
 main().catch((error) => {

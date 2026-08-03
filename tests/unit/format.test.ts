@@ -7,7 +7,7 @@ import {
   formatToolResult,
   outputLines,
 } from "../../src/ui/format.js";
-import { COLOR_PALETTE, NO_COLOR_PALETTE } from "../../src/ui/style.js";
+import { BASIC_PALETTE, NO_COLOR_PALETTE } from "../../src/ui/theme.js";
 import { displayWidth } from "../../src/ui/width.js";
 
 const plain = NO_COLOR_PALETTE;
@@ -39,7 +39,7 @@ describe("formatToolResult (spec §14.4 P0)", () => {
 
 describe("formatToolCall", () => {
   it("colours the glyph but leaves the command alone", () => {
-    const rendered = formatToolCall("$ npm test", COLOR_PALETTE);
+    const rendered = formatToolCall("$ npm test", BASIC_PALETTE);
     expect(rendered).toContain("npm test");
     // Everything after the glyph is content, and tinting content is how a
     // palette turns into decoration.
@@ -114,7 +114,7 @@ describe("markdown (spec §14.4 P3)", () => {
   it("does not change the printed width when colour is on", () => {
     // The live frame erases by row count; a styled line that measures wider
     // than it prints would corrupt the redraw (spec §14.3).
-    const md = createMarkdownRenderer(COLOR_PALETTE);
+    const md = createMarkdownRenderer(BASIC_PALETTE);
     expect(displayWidth(md.render("a **bold** word"))).toBe("a bold word".length);
   });
 });

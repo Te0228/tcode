@@ -8,7 +8,7 @@
  * would otherwise catch.
  */
 import type { DisplayLine } from "../tools/types.js";
-import type { Palette } from "./style.js";
+import type { Palette } from "./theme.js";
 
 /** Indent under a tool call, so results read as belonging to it. */
 export const RESULT_INDENT = "  ";

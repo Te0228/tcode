@@ -9,7 +9,7 @@
  * Parsing and help text live here, as pure functions. Dispatch stays in the
  * REPL, which is the only thing holding the session and the agent deps.
  */
-import type { Palette } from "./ui/style.js";
+import type { Palette } from "./ui/theme.js";
 
 export interface CommandSpec {
   name: string;

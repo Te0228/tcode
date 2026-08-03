@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SPINNER_FRAMES, createSpinner } from "../../src/ui/spinner.js";
-import { NO_COLOR_PALETTE } from "../../src/ui/style.js";
+import { NO_COLOR_PALETTE } from "../../src/ui/theme.js";
 import { charWidth } from "../../src/ui/width.js";
 
 function clock(start = 0) {

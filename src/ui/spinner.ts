@@ -9,7 +9,7 @@
  *
  * Pure state plus a formatter; the caller owns the timer and the drawing.
  */
-import type { Palette } from "./style.js";
+import type { Palette } from "./theme.js";
 
 /** Braille dots: one cell wide everywhere, and the convention every tool in
  * this class already uses. */

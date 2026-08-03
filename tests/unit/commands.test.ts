@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { COMMANDS, isKnownCommand, parseCommand, renderHelp, unknownCommand } from "../../src/commands.js";
-import { NO_COLOR_PALETTE } from "../../src/ui/style.js";
+import { NO_COLOR_PALETTE } from "../../src/ui/theme.js";
 
 describe("parseCommand (spec §15.3)", () => {
   it("splits the name from its arguments", () => {

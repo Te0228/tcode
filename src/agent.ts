@@ -30,7 +30,7 @@ import { FINISH_TOOL_NAME, finishPayloadOf, type FinishPayload } from "./tools/f
 import { BASE_TOOLS, type ToolRegistry } from "./tools/index.js";
 import { normalizeToolReturn, truncateOutput } from "./tools/types.js";
 import { formatToolCall, formatToolResult, outputLines } from "./ui/format.js";
-import { NO_COLOR_PALETTE, type Palette } from "./ui/style.js";
+import { NO_COLOR_PALETTE, type Palette } from "./ui/theme.js";
 import type { Activity } from "./ui/spinner.js";
 
 export interface AgentDeps {

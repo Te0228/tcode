@@ -171,12 +171,19 @@ export interface ApprovalPolicy {
   reasonFor(toolUse: ToolUseBlock): string | undefined;
 }
 
+/** Result of asking the user (spec §16.6). `always` records the command
+ * for the rest of the process, nothing more — a persistent allowlist is a
+ * different decision and not one to make in passing. */
+export type ApprovalAnswer = "yes" | "always" | "no";
+
 export interface ApprovalOptions {
   /** Project root — the boundary the whole policy is defined against. */
   root: string;
   /** `--full-auto` startup flag: skip confirmation entirely (spec §8.2). */
   fullAuto?: boolean;
-  /** Prompt hook, injected in tests so no TTY is needed. */
+  /** Single-keypress dialog (spec §16.6). Preferred when present. */
+  ask?: (request: { command: string; reason: string }) => Promise<ApprovalAnswer>;
+  /** Text fallback for a pipe, and for tests that need no TTY. */
   prompt?: (question: string) => Promise<string>;
 }
 
@@ -198,11 +205,15 @@ function commandOf(toolUse: ToolUseBlock): string {
 }
 
 export function createApprovalPolicy(options: ApprovalOptions): ApprovalPolicy {
-  const ask = options.prompt ?? promptOnStdin;
+  const askText = options.prompt ?? promptOnStdin;
   const root = path.resolve(options.root);
+  /** Commands the user chose "don't ask again" for. Process-scoped and
+   * never written to disk (spec §16.6). */
+  const allowed = new Set<string>();
 
   const decide = (toolUse: ToolUseBlock): ApprovalDecision => {
     if (options.fullAuto) return { needsConfirmation: false };
+    if (allowed.has(commandOf(toolUse).trim())) return { needsConfirmation: false };
     // Only bash is opaque. The file tools are hard-bounded by
     // `resolveInRoot`, and `remember` writes a path fixed in code.
     if (toolUse.name !== BASH_TOOL_NAME) return { needsConfirmation: false };
@@ -214,8 +225,19 @@ export function createApprovalPolicy(options: ApprovalOptions): ApprovalPolicy {
     reasonFor: (toolUse) => decide(toolUse).reason,
 
     async confirm(toolUse) {
-      const reason = decide(toolUse).reason;
-      const answer = (await ask(`  ${reason ?? "run this"}. proceed? [Y/n] `)).trim().toLowerCase();
+      const reason = decide(toolUse).reason ?? "run this";
+      const command = commandOf(toolUse).trim();
+
+      if (options.ask) {
+        const answer = await options.ask({ command, reason });
+        // Repeating the same command a dozen times in one task and being
+        // asked every time is how users learn to confirm without reading —
+        // the approval fatigue §5.1 exists to avoid.
+        if (answer === "always") allowed.add(command);
+        return answer !== "no";
+      }
+
+      const answer = (await askText(`  ${reason}. proceed? [Y/n] `)).trim().toLowerCase();
       // Enter (empty answer) means yes; only an explicit "n"/"no" declines.
       return answer !== "n" && answer !== "no";
     },
