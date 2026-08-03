@@ -313,6 +313,7 @@ async function main(): Promise<void> {
     palette,
     columns,
     complete: interactive ? createCompleter(root) : undefined,
+    commands: COMMANDS,
     history: interactive ? loadHistory(root) : undefined,
     status: () => ({
       left: `${providerConfig.model} · ${formatTokens(contextTokens)}/${formatTokens(providerConfig.contextWindowTokens)}`,
@@ -370,8 +371,13 @@ async function main(): Promise<void> {
 
   const log = (text: string) => view.note(text);
 
+  // A turn is a message the *user* sent on their own. Steering folds a text
+  // block into the tool_result message (spec §3.2) and an interrupt appends
+  // a note, both with role "user" — counting those inflated the number by
+  // half on a long session.
   let turnIndex = session.messages.filter(
-    (message) => message.role === "user" && message.content.some((block) => block.type === "text"),
+    (message) =>
+      message.role === "user" && message.content.every((block) => block.type === "text"),
   ).length;
 
   const clock = () => {

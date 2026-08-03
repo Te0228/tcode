@@ -56,6 +56,9 @@ export interface EditorOptions {
   columns(): number;
   /** Tab completion (spec §15.4). */
   complete?(line: string): [string[], string];
+  /** Slash commands, for the menu that opens on `/` (spec §17.5b). Same
+   * data as `/help`; two copies would drift. */
+  commands?: { name: string; summary: string }[];
   /** Seed from disk, newest first (spec §15.5). */
   history?: string[];
   /** Right-hand hints in the status bar; recomputed on every render so
@@ -89,6 +92,23 @@ export function createEditor(options: EditorOptions) {
 
   const clampCursor = () => {
     cursor = Math.max(0, Math.min(cursor, buffer.length));
+  };
+
+  /** Which position in the command menu is highlighted; the menu is open
+   * whenever `matchingCommands()` is non-empty. */
+  let menuIndex = 0;
+
+  /**
+   * Commands matching what has been typed so far. Open only while the line
+   * is a bare `/word` — once there is a space the user is writing
+   * arguments, and a menu on top of that is in the way.
+   */
+  const matchingCommands = () => {
+    if (!options.commands) return [];
+    const match = /^\/([a-zA-Z-]*)$/.exec(buffer);
+    if (!match) return [];
+    const typed = match[1].toLowerCase();
+    return options.commands.filter((command) => command.name.startsWith(typed));
   };
 
   const wordLeft = (): number => {
@@ -270,13 +290,28 @@ export function createEditor(options: EditorOptions) {
             cursor = 0;
             return { type: "none" };
           }
+          // Enter on an open menu runs the highlighted command rather than
+          // whatever prefix happens to be typed.
+          const open = matchingCommands();
+          if (open.length > 0) {
+            const picked = `/${open[Math.min(menuIndex, open.length - 1)].name}`;
+            setLine(picked);
+            menuIndex = 0;
+          }
           const text = [...draft, buffer].join("\n").trim();
           remember(text);
           takeMessage();
           return { type: "submit", text };
         }
-        case "tab":
+        case "tab": {
+          const open = matchingCommands();
+          if (open.length > 0) {
+            setLine(`/${open[Math.min(menuIndex, open.length - 1)].name} `);
+            menuIndex = 0;
+            return { type: "none" };
+          }
           return applyCompletion();
+        }
         case "backspace":
           if (cursor > 0) {
             buffer = buffer.slice(0, cursor - 1) + buffer.slice(cursor);
@@ -302,12 +337,26 @@ export function createEditor(options: EditorOptions) {
         case "end":
           cursor = buffer.length;
           return { type: "none" };
-        case "up":
+        case "up": {
+          // The menu takes the arrows while it is open; history gets them
+          // back the moment it closes.
+          const open = matchingCommands();
+          if (open.length > 0) {
+            menuIndex = (menuIndex - 1 + open.length) % open.length;
+            return { type: "none" };
+          }
           walkHistory(1);
           return { type: "none" };
-        case "down":
+        }
+        case "down": {
+          const open = matchingCommands();
+          if (open.length > 0) {
+            menuIndex = (menuIndex + 1) % open.length;
+            return { type: "none" };
+          }
           walkHistory(-1);
           return { type: "none" };
+        }
         default:
           if (char && !key.ctrl && !key.meta) insert(char);
           return { type: "none" };
@@ -349,7 +398,27 @@ export function createEditor(options: EditorOptions) {
       const scroll = Math.max(0, typed - available + 1);
       const visible = sliceByWidth(buffer, scroll, available);
 
-      const lines = [`${prefix}${marker}${visible}`];
+      const lines: string[] = [];
+
+      // The menu floats above the input line: typing `/` has to produce
+      // something visible, or the commands may as well not exist (§17.5b).
+      const open = matchingCommands();
+      if (open.length > 0) {
+        menuIndex = Math.min(menuIndex, open.length - 1);
+        const nameWidth = Math.max(...open.map((command) => command.name.length)) + 1;
+        for (const [at, command] of open.entries()) {
+          const label = `  /${command.name}`.padEnd(nameWidth + 3);
+          const row = `${label}  ${command.summary}`;
+          lines.push(
+            at === menuIndex
+              ? tintedRow(palette.accent2(row), width, palette.selectedRow)
+              : palette.meta(row),
+          );
+        }
+      }
+
+      lines.push(`${prefix}${marker}${visible}`);
+      const inputRow = lines.length - 1;
       if (status) {
         lines.push(
           tintedRow(
@@ -362,7 +431,7 @@ export function createEditor(options: EditorOptions) {
 
       return {
         lines,
-        cursorRow: 0,
+        cursorRow: inputRow,
         cursorCol: before + typed - scroll,
       };
     },

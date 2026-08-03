@@ -267,3 +267,70 @@ describe("editor: long input scrolls instead of overflowing (spec §16.2)", () =
     expect(region.cursorCol).toBeLessThan(20);
   });
 });
+
+describe("editor: the command menu (spec §17.5b)", () => {
+  const commands = [
+    { name: "help", summary: "list these commands" },
+    { name: "sessions", summary: "list sessions" },
+    { name: "new", summary: "start an empty session" },
+  ];
+  const withMenu = () => editor({ commands, columns: () => 60 });
+
+  it("opens the moment a slash is typed", () => {
+    // Typing `/` and seeing nothing is why the commands read as missing:
+    // they worked, but nothing said so.
+    const ed = withMenu();
+    type(ed, "/");
+    const rendered = ed.render().lines.join("\n");
+    for (const command of commands) expect(rendered).toContain(`/${command.name}`);
+  });
+
+  it("filters as more is typed", () => {
+    const ed = withMenu();
+    type(ed, "/se");
+    const rendered = ed.render().lines.join("\n");
+    expect(rendered).toContain("/sessions");
+    expect(rendered).not.toContain("/help");
+  });
+
+  it("closes once there is an argument", () => {
+    // A menu on top of the arguments is in the way.
+    const ed = withMenu();
+    type(ed, "/resume abc");
+    expect(ed.render().lines).toHaveLength(1);
+  });
+
+  it("closes for something that is not a command", () => {
+    const ed = withMenu();
+    type(ed, "/zzz");
+    expect(ed.render().lines).toHaveLength(1);
+  });
+
+  it("takes the arrows while open and gives them back after", () => {
+    const ed = editor({ commands, history: ["earlier"], columns: () => 60 });
+    type(ed, "/");
+    ed.handleKey(undefined, key("down"));
+    ed.handleKey(undefined, key("tab"));
+    expect(ed.line).toBe("/sessions ");
+
+    ed.setLine("");
+    ed.handleKey(undefined, key("up"));
+    expect(ed.line).toBe("earlier");
+  });
+
+  it("Enter runs the highlighted entry, not the prefix", () => {
+    const ed = withMenu();
+    type(ed, "/s");
+    expect(ed.handleKey(undefined, key("return"))).toEqual({
+      type: "submit",
+      text: "/sessions",
+    });
+  });
+
+  it("keeps the cursor on the input row, below the menu", () => {
+    const ed = withMenu();
+    type(ed, "/");
+    const region = ed.render();
+    expect(region.cursorRow).toBe(region.lines.length - 1);
+  });
+});
